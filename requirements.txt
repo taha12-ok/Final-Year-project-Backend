@@ -5,9 +5,9 @@ python-multipart==0.0.6
 torch==2.5.0+cpu
 torchvision
 pillow==10.4.0
-numpy==1.26.4
+numpy==2.1.0
 python-dotenv==1.0.0
 reportlab==4.0.7
 opencv-python-headless==4.8.1.78
-pytorch-grad-cam==1.4.8
+grad-cam
 groq==0.4.0
