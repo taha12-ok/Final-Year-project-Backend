@@ -29,30 +29,25 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 app = FastAPI()
 
-# ── CORS Middleware (CHANGE: Specific URLs for security) ──
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://final_year_project.vercel.app",  # Frontend URL (Vercel)
-        "http://localhost:3000",                   # Local development
-        "http://localhost:3001",                   # Local fallback
+        "https://final_year_project.vercel.app",
+        "http://localhost:3000",
+        "http://localhost:3001",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── Groq Client ──
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# ── Device ──
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ── Model Directory (CHANGE: Absolute path) ──
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def load_model(path, num_classes):
-    """Load model with proper path handling"""
     model_path = os.path.join(BASE_DIR, path)
     m = models.resnet50(weights=None)
     m.fc = torch.nn.Linear(m.fc.in_features, num_classes)
@@ -60,54 +55,69 @@ def load_model(path, num_classes):
     m.eval().to(device)
     return m
 
-# ── Load All Models ──
-fracture_model = load_model("fracture_model.pth", 2)
-chest_model    = load_model("chest_model.pth",    3)
-brain_model    = load_model("brain_model.pth",    4)
-skin_model     = load_model("skin_model.pth",     7)
-breast_model   = load_model("breast_model.pth",   3)
-eye_model      = load_model("eye_model.pth",      4)
-kidney_model   = load_model("kidney_model.pth",   4)
-
-# ── Classes ──
+# ── Lazy Loading Models ──
 MODELS = {
     "fracture": {
-        "model":   fracture_model,
+        "path": "fracture_model.pth",
         "classes": ["Fractured", "Not Fractured"],
-        "scan":    "X-ray"
+        "scan": "X-ray",
+        "num_classes": 2,
+        "model": None
     },
     "chest": {
-        "model":   chest_model,
+        "path": "chest_model.pth",
         "classes": ["COVID-19", "Normal", "Pneumonia"],
-        "scan":    "Chest X-ray"
+        "scan": "Chest X-ray",
+        "num_classes": 3,
+        "model": None
     },
     "brain": {
-        "model":   brain_model,
+        "path": "brain_model.pth",
         "classes": ["Glioma", "Meningioma", "No Tumor", "Pituitary"],
-        "scan":    "Brain MRI"
+        "scan": "Brain MRI",
+        "num_classes": 4,
+        "model": None
     },
     "skin": {
-        "model":   skin_model,
+        "path": "skin_model.pth",
         "classes": ["Actinic Keratosis", "Basal Cell Carcinoma", "Dermatofibroma",
                     "Melanoma", "Nevus", "Pigmented Benign Keratosis", "Seborrheic Keratosis"],
-        "scan":    "Skin Image"
+        "scan": "Skin Image",
+        "num_classes": 7,
+        "model": None
     },
     "breast": {
-        "model":   breast_model,
+        "path": "breast_model.pth",
         "classes": ["Benign", "Normal", "Malignant"],
-        "scan":    "Ultrasound"
+        "scan": "Ultrasound",
+        "num_classes": 3,
+        "model": None
     },
     "eye": {
-        "model":   eye_model,
+        "path": "eye_model.pth",
         "classes": ["Cataract", "Diabetic Retinopathy", "Glaucoma", "Normal"],
-        "scan":    "Retina Image"
+        "scan": "Retina Image",
+        "num_classes": 4,
+        "model": None
     },
     "kidney": {
-        "model":   kidney_model,
+        "path": "kidney_model.pth",
         "classes": ["Cyst", "Normal", "Stone", "Tumor"],
-        "scan":    "CT Scan"
+        "scan": "CT Scan",
+        "num_classes": 4,
+        "model": None
     },
 }
+
+def get_model(model_type):
+    if MODELS[model_type]["model"] is None:
+        print(f"Loading {model_type} model...")
+        MODELS[model_type]["model"] = load_model(
+            MODELS[model_type]["path"],
+            MODELS[model_type]["num_classes"]
+        )
+        print(f"{model_type} model loaded!")
+    return MODELS[model_type]["model"]
 
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -136,8 +146,6 @@ def run_inference(model, image):
 
     return predicted.item(), round(confidence.item() * 100, 2), img_base64
 
-# ── Routes ──
-
 @app.get("/")
 def home():
     return {"message": "Medical AI Platform Ready! 7 Models + AI Doctor Loaded ✅"}
@@ -149,7 +157,7 @@ async def predict(model_type: str, file: UploadFile = File(...)):
 
     contents = await file.read()
     image    = Image.open(io.BytesIO(contents)).convert("RGB")
-    m        = MODELS[model_type]["model"]
+    m        = get_model(model_type)
     classes  = MODELS[model_type]["classes"]
     predicted, confidence, gradcam = run_inference(m, image)
 
