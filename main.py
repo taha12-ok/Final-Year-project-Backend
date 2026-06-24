@@ -31,12 +31,8 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://final_year_project.vercel.app",
-        "http://localhost:3000",
-        "http://localhost:3001",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -55,7 +51,6 @@ def load_model(path, num_classes):
     m.eval().to(device)
     return m
 
-# ── Lazy Loading Models ──
 MODELS = {
     "fracture": {
         "path": "fracture_model.pth",
@@ -133,8 +128,8 @@ def run_inference(model, image):
     tensor      = transform(image).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        outputs              = model(tensor)
-        probs                = torch.softmax(outputs, dim=1)
+        outputs               = model(tensor)
+        probs                 = torch.softmax(outputs, dim=1)
         confidence, predicted = probs.max(1)
 
     cam           = GradCAM(model=model, target_layers=[model.layer4[-1]])
