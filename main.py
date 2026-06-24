@@ -29,13 +29,6 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 app = FastAPI()
 
-@app.on_event("startup")
-async def preload_models():
-    print("Preloading all models...")
-    for key in MODELS:
-        get_model(key)
-    print("All models loaded!")
-    
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
