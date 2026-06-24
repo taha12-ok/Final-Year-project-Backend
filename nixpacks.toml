@@ -2,4 +2,4 @@
 MISE_PYTHON_GITHUB_ATTESTATIONS = "false"
 
 [phases.setup]
-nixPkgs = ["libxcb"]
+nixPkgs = ["xorg.libxcb", "xorg.libX11", "libGL"]
