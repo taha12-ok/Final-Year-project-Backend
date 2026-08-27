@@ -11,6 +11,7 @@ import numpy as np
 import cv2
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
+   from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle, HRFlowable
