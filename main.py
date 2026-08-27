@@ -104,7 +104,8 @@ def run_inference(model, image):
         confidence, predicted = probs.max(1)
 
     cam           = GradCAM(model=model, target_layers=[model.layer4[-1]])
-    grayscale_cam = cam(input_tensor=tensor)[0]
+    targets = [ClassifierOutputTarget(predicted.item())]    
+    grayscale_cam = cam(input_tensor=tensor, targets=targets)[0]
     visualization = show_cam_on_image(img_float, grayscale_cam, use_rgb=True)
 
     _, buffer  = cv2.imencode('.jpg', cv2.cvtColor(visualization, cv2.COLOR_RGB2BGR))
