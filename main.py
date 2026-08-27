@@ -59,39 +59,10 @@ MODELS = {
         "num_classes": 2,
         "model": None
     },
-    "chest": {
-        "path": "chest_model.pth",
-        "classes": ["COVID-19", "Normal", "Pneumonia"],
-        "scan": "Chest X-ray",
-        "num_classes": 3,
-        "model": None
-    },
     "brain": {
         "path": "brain_model.pth",
         "classes": ["Glioma", "Meningioma", "No Tumor", "Pituitary"],
         "scan": "Brain MRI",
-        "num_classes": 4,
-        "model": None
-    },
-    "skin": {
-        "path": "skin_model.pth",
-        "classes": ["Actinic Keratosis", "Basal Cell Carcinoma", "Dermatofibroma",
-                    "Melanoma", "Nevus", "Pigmented Benign Keratosis", "Seborrheic Keratosis"],
-        "scan": "Skin Image",
-        "num_classes": 7,
-        "model": None
-    },
-    "breast": {
-        "path": "breast_model.pth",
-        "classes": ["Benign", "Normal", "Malignant"],
-        "scan": "Ultrasound",
-        "num_classes": 3,
-        "model": None
-    },
-    "eye": {
-        "path": "eye_model.pth",
-        "classes": ["Cataract", "Diabetic Retinopathy", "Glaucoma", "Normal"],
-        "scan": "Retina Image",
         "num_classes": 4,
         "model": None
     },
@@ -143,7 +114,7 @@ def run_inference(model, image):
 
 @app.get("/")
 def home():
-    return {"message": "Medical AI Platform Ready! 7 Models + AI Doctor Loaded ✅"}
+    return {"message": "Medical AI Platform Ready! 3 Models + AI Doctor Loaded ✅"}
 
 @app.post("/predict/{model_type}")
 async def predict(model_type: str, file: UploadFile = File(...)):
@@ -198,11 +169,7 @@ List specific tests needed (blood tests, X-ray, MRI, CT scan, etc.)
 ## 🏥 Which AI Model to Use
 Based on the symptoms, suggest which of our AI detection models to use:
 - 🦴 Fracture Detection (X-ray)
-- 🫁 Chest Disease (Chest X-ray)
 - 🧠 Brain Tumor (Brain MRI)
-- 🔬 Skin Cancer (Skin Image)
-- 🎗️ Breast Cancer (Ultrasound)
-- 👁️ Eye Disease (Retina Image)
 - 🫘 Kidney Disease (CT Scan)
 
 ## 💊 Immediate Recommendations
