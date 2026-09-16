@@ -10,37 +10,63 @@ Changes vs purana version:
   6. /metrics/{model} — retraining metrics serve karta hai (dashboard ke liye)
   7. /ai-doctor REMOVED — assistant ab sirf frontend (Next.js API route) me hai.
      Yahan 410 Gone milta hai purane callers ko.
+  8. DUAL ENGINE    — agar ONNX models mojood hon to torch-free ONNX runtime
+     use hota hai (512MB RAM free tier ke liye — onnx_engine.py), warna
+     PyTorch .pth wala original engine.
 
 Env vars:
   ALLOWED_ORIGINS   comma-separated, e.g. "https://final-year-project-medai.vercel.app,http://localhost:3000"
   MAX_UPLOAD_MB     default 10
-  PRELOAD_MODELS    "1" => startup pe teeno models load (HF Space ke liye recommended)
+  PRELOAD_MODELS    "1" => startup pe teeno models load (recommended)
+  ENGINE            "auto" (default) | "onnx" | "torch"
 """
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-import torch
-import torchvision.models as models
-from torchvision import transforms
-from PIL import Image, ImageFile
-import io
-import base64
-import json
 import os
+import io
 import time
 import tempfile
 from datetime import datetime
 from collections import defaultdict, deque
 
+from PIL import Image, ImageFile
+
 import numpy as np
-import cv2
-from pytorch_grad_cam import GradCAM
-from pytorch_grad_cam.utils.image import show_cam_on_image
-from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 
 from modality import check_image
 from calibration import get_temperature, calibrated_softmax, evaluate_confidence
+
+# ── Engine selection: ONNX (torch-free) ya PyTorch ──
+ENGINE_MODE = os.getenv("ENGINE", "auto")  # auto | onnx | torch
+
+
+def _has_onnx(model_type: str) -> bool:
+    base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.exists(os.path.join(base, f"{model_type}_model_int8.onnx")) or \
+        os.path.exists(os.path.join(base, f"{model_type}_model.onnx"))
+
+
+USE_ONNX = (
+    ENGINE_MODE == "onnx"
+    or (ENGINE_MODE == "auto" and all(_has_onnx(k) for k in ("fracture", "brain", "kidney")))
+)
+
+if USE_ONNX:
+    import onnx_engine
+    import cv2  # noqa: F401 (onnx_engine overlay ke liye zaroori)
+else:
+    import torch
+    import torchvision.models as models
+    from torchvision import transforms
+    import cv2
+    import base64
+    from pytorch_grad_cam import GradCAM
+    from pytorch_grad_cam.utils.image import show_cam_on_image
+    from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -48,7 +74,10 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 # Config
 # ─────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if not USE_ONNX:
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+else:
+    DEVICE = None
 
 ALLOWED_ORIGINS = [
     o.strip() for o in os.getenv(
@@ -65,6 +94,18 @@ RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "30"))   # requests
 RATE_LIMIT_WINDOW_S  = int(os.getenv("RATE_LIMIT_WINDOW_S", "60"))  # per window
 
 MODELS_DIR = os.path.join(BASE_DIR, "metrics")  # metrics/*.json
+
+if USE_ONNX:
+    # ONNX engine ka apna registry use karo (classes wahi, file names .onnx)
+    MODELS = {
+        k: {
+            "classes": onnx_engine.MODELS[k]["classes"],
+            "scan": onnx_engine.MODELS[k]["scan"],
+            "num_classes": onnx_engine.MODELS[k]["num_classes"],
+            "model": None,
+        }
+        for k in onnx_engine.MODELS
+    }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -117,66 +158,68 @@ app.add_middleware(RateLimitMiddleware, max_requests=RATE_LIMIT_REQUESTS, window
 
 
 # ─────────────────────────────────────────────────────────────
-# Models
+# Models (PyTorch engine — sirf tab jab ONNX mojood na ho)
 # ─────────────────────────────────────────────────────────────
-MODELS = {
-    "fracture": {
-        "path": "fracture_model.pth",
-        "classes": ["Fractured", "Not Fractured"],
-        "scan": "X-ray",
-        "num_classes": 2,
-        "model": None,
-    },
-    "brain": {
-        "path": "brain_model.pth",
-        "classes": ["Glioma", "Meningioma", "No Tumor", "Pituitary"],
-        "scan": "Brain MRI",
-        "num_classes": 4,
-        "model": None,
-    },
-    "kidney": {
-        "path": "kidney_model.pth",
-        "classes": ["Cyst", "Normal", "Stone", "Tumor"],
-        "scan": "CT Scan",
-        "num_classes": 4,
-        "model": None,
-    },
-}
+if not USE_ONNX:
+    MODELS = {
+        "fracture": {
+            "path": "fracture_model.pth",
+            "classes": ["Fractured", "Not Fractured"],
+            "scan": "X-ray",
+            "num_classes": 2,
+            "model": None,
+        },
+        "brain": {
+            "path": "brain_model.pth",
+            "classes": ["Glioma", "Meningioma", "No Tumor", "Pituitary"],
+            "scan": "Brain MRI",
+            "num_classes": 4,
+            "model": None,
+        },
+        "kidney": {
+            "path": "kidney_model.pth",
+            "classes": ["Cyst", "Normal", "Stone", "Tumor"],
+            "scan": "CT Scan",
+            "num_classes": 4,
+            "model": None,
+        },
+    }
 
-# IMPORTANT: yeh order RETRAINING NOTEBOOK ke classes se match hona chahiye.
-# Notebook ye order hi use karta hai, isliye drop-in compatible hai.
-
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225]),
-])
-
-
-def load_model(path: str, num_classes: int):
-    m = models.resnet50(weights=None)
-    m.fc = torch.nn.Linear(m.fc.in_features, num_classes)
-    m.load_state_dict(torch.load(path, map_location=DEVICE))
-    return m.eval().to(DEVICE)
+    # IMPORTANT: yeh order RETRAINING NOTEBOOK ke classes se match hona chahiye.
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                            [0.229, 0.224, 0.225]),
+    ])
 
 
-def get_model(model_type: str):
-    entry = MODELS[model_type]
-    if entry["model"] is None:
-        print(f"[startup] Loading {model_type} model...")
-        entry["model"] = load_model(
-            os.path.join(BASE_DIR, entry["path"]), entry["num_classes"]
-        )
-        print(f"[startup] {model_type} model loaded!")
-    return entry["model"]
+if not USE_ONNX:
+    def load_model(path: str, num_classes: int):
+        m = models.resnet50(weights=None)
+        m.fc = torch.nn.Linear(m.fc.in_features, num_classes)
+        m.load_state_dict(torch.load(path, map_location=DEVICE))
+        return m.eval().to(DEVICE)
+
+    def get_model(model_type: str):
+        entry = MODELS[model_type]
+        if entry["model"] is None:
+            print(f"[startup] Loading {model_type} model...")
+            entry["model"] = load_model(
+                os.path.join(BASE_DIR, entry["path"]), entry["num_classes"]
+            )
+            print(f"[startup] {model_type} model loaded!")
+        return entry["model"]
 
 
 @app.on_event("startup")
 def preload():
     if os.getenv("PRELOAD_MODELS", "0") == "1":
-        for k in MODELS:
-            get_model(k)
+        if USE_ONNX:
+            onnx_engine.preload_all()
+        else:
+            for k in MODELS:
+                get_model(k)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -198,7 +241,7 @@ def read_upload_image(file: UploadFile) -> Image.Image:
 
 
 def run_inference(model, image: Image.Image, model_type: str):
-    """Temperature-calibrated inference + Grad-CAM."""
+    """Temperature-calibrated inference + Grad-CAM (PyTorch engine)."""
     img_resized = image.resize((224, 224))
     img_float = np.float32(np.array(img_resized)) / 255.0
     tensor = transform(image).unsqueeze(0).to(DEVICE)
@@ -247,7 +290,8 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "device": str(DEVICE), "time": datetime.utcnow().isoformat() + "Z"}
+    return {"status": "ok", "device": "onnx-cpu" if USE_ONNX else str(DEVICE),
+            "engine": "onnx" if USE_ONNX else "torch", "time": datetime.utcnow().isoformat() + "Z"}
 
 
 @app.post("/predict/{model_type}")
@@ -271,9 +315,29 @@ async def predict(model_type: str, file: UploadFile = File(...)):
         )
 
     # ── GATE 2: calibrated confidence ──
-    m = get_model(model_type)
-    predicted, confidence, gradcam, alternatives, reliability, temperature = \
-        run_inference(m, image, model_type)
+    temperature = get_temperature(model_type)
+
+    if USE_ONNX:
+        predicted, confidence, heat, logits = onnx_engine.run_inference(
+            model_type, image, temperature
+        )
+        gradcam = onnx_engine.overlay_heatmap(image, heat) if heat is not None else None
+
+        z = logits / max(temperature, 1e-6)
+        z -= z.max()
+        e = np.exp(z)
+        probs = e / e.sum()
+        order = np.argsort(probs)[::-1]
+        alternatives = [
+            {"class": entry["classes"][int(i)],
+             "confidence": round(float(probs[int(i)]) * 100, 2)}
+            for i in order[1:4]
+        ]
+        reliability = evaluate_confidence(confidence)
+    else:
+        m = get_model(model_type)
+        predicted, confidence, gradcam, alternatives, reliability, temperature = \
+            run_inference(m, image, model_type)
 
     return {
         "result": entry["classes"][predicted],
