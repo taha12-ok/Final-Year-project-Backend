@@ -133,6 +133,25 @@ def preprocess(image: Image.Image) -> np.ndarray:
     return np.ascontiguousarray(arr)
 
 
+def _fc_weights_for(model_type: str) -> Optional[np.ndarray]:
+    w = _fc_weights.get(model_type)
+    if w is not None:
+        return w
+    # pehle .npy sidecar (retrained .pth se export) — int8 graph me fc extract nahi hota
+    npy = os.path.join(BASE_DIR, f"{model_type}_fc.npy")
+    if os.path.exists(npy):
+        try:
+            w = np.load(npy).astype(np.float32)
+            _fc_weights[model_type] = w
+            return w
+        except Exception as e:
+            print(f"[warn] fc npy load failed for {model_type}: {e}")
+    w = _extract_fc_weights(get_session(model_type), model_type)
+    if w is not None:
+        _fc_weights[model_type] = w
+    return w
+
+
 def _am_with_hook(model_type: str, input_arr: np.ndarray, pred: int) -> Optional[np.ndarray]:
     """
     ONNX graph me last conv output ko extra output banake activations nikaalo,
@@ -142,7 +161,10 @@ def _am_with_hook(model_type: str, input_arr: np.ndarray, pred: int) -> Optional
         import onnx
         import onnxruntime as ort2
 
-        src_path = _model_meta[model_type]["file"]
+        src_path = _model_meta.get(model_type, {}).get("file") or _find_model_file(MODELS[model_type])
+        if not src_path:
+            print(f"[warn] AM: no ONNX file for {model_type}")
+            return None
         am_path = os.path.join(BASE_DIR, f".cache_{model_type}_am.onnx")
 
         if not os.path.exists(am_path):
@@ -179,8 +201,12 @@ def _am_with_hook(model_type: str, input_arr: np.ndarray, pred: int) -> Optional
         sess2 = ort2.InferenceSession(am_path, sess_options=so, providers=["CPUExecutionProvider"])
         outputs = sess2.run(None, {"input": input_arr})
         feats = outputs[-1][0]  # expected [C, H, W] e.g. [2048, 7, 7]
-        w = _fc_weights.get(model_type)
-        if w is None or feats.ndim != 3:
+        w = _fc_weights_for(model_type)
+        if w is None:
+            print(f"[warn] AM: fc weights unavailable for {model_type}")
+            return None
+        if feats.ndim != 3:
+            print(f"[warn] AM: unexpected feats ndim {feats.shape} for {model_type}")
             return None
         # Shape sanity: channels must match fc weight input dim
         if feats.shape[0] != w.shape[1]:
@@ -188,6 +214,7 @@ def _am_with_hook(model_type: str, input_arr: np.ndarray, pred: int) -> Optional
             if feats.shape[2] == w.shape[1]:
                 feats = np.transpose(feats, (2, 0, 1))
             else:
+                print(f"[warn] AM: feats {feats.shape} vs fc {w.shape} mismatch for {model_type}")
                 return None
         cam = np.tensordot(w[pred], feats, axes=([0], [0]))  # [7,7]
         cam = cam - cam.min()
