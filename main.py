@@ -56,7 +56,7 @@ USE_ONNX = (
 
 if USE_ONNX:
     import onnx_engine
-    import cv2  # noqa: F401 (onnx_engine overlay ke liye zaroori)
+    # cv2 free-tier images me nahi — overlay PIL se hota hai (onnx_engine.overlay_heatmap)
 else:
     import torch
     import torchvision.models as models

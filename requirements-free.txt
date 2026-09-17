@@ -1,4 +1,5 @@
-# Free-tier deployment (Render 512MB RAM) — torch-free ONNX stack
+# Free-tier deployment (Back4App 256MB / Render 512MB) — torch-free ONNX stack
+# NOTE: opencv nahi — overlay/visuals PIL + numpy se hote hain (cv2 ~80MB RAM bachata hai)
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-multipart==0.0.6
@@ -6,6 +7,5 @@ onnxruntime==1.17.0
 onnx==1.15.0
 pillow==10.4.0
 numpy==1.26.4
-opencv-python-headless==4.8.1.78
 reportlab==4.0.7
 python-dotenv==1.0.0
