@@ -1,0 +1,135 @@
+{
+  "model": "brain",
+  "architecture": "resnet50",
+  "classes": [
+    "Glioma",
+    "Meningioma",
+    "No Tumor",
+    "Pituitary"
+  ],
+  "accuracy": 0.9893,
+  "best_val_accuracy": 0.9893,
+  "per_class_f1": {
+    "Glioma": 0.9929,
+    "Meningioma": 0.9821,
+    "No Tumor": 0.9892,
+    "Pituitary": 0.9929
+  },
+  "per_class_f1_by_index": [
+    0.9929,
+    0.9821,
+    0.9892,
+    0.9929
+  ],
+  "macro_f1": 0.9893,
+  "confusion_matrix": [
+    [
+      140,
+      0,
+      0,
+      0
+    ],
+    [
+      1,
+      137,
+      1,
+      1
+    ],
+    [
+      1,
+      1,
+      138,
+      0
+    ],
+    [
+      0,
+      1,
+      0,
+      139
+    ]
+  ],
+  "temperature": 0.6964,
+  "epochs_run": 13,
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.46721306301298593,
+      "val_loss": 0.28635308401925225,
+      "val_acc": 0.9678571428571429
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.28814465081880963,
+      "val_loss": 0.3548095907483782,
+      "val_acc": 0.9392857142857143
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.26083544114279367,
+      "val_loss": 0.24933212399482726,
+      "val_acc": 0.9767857142857143
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.23843674328592088,
+      "val_loss": 0.2579954419817243,
+      "val_acc": 0.9785714285714285
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.22953859359499007,
+      "val_loss": 0.24428047367504666,
+      "val_acc": 0.9857142857142858
+    },
+    {
+      "epoch": 6,
+      "train_loss": 0.2207623645426735,
+      "val_loss": 0.24197343843323843,
+      "val_acc": 0.9857142857142858
+    },
+    {
+      "epoch": 7,
+      "train_loss": 0.21495165138963668,
+      "val_loss": 0.23627720390047346,
+      "val_acc": 0.9875
+    },
+    {
+      "epoch": 8,
+      "train_loss": 0.21158398749336363,
+      "val_loss": 0.23604547466550554,
+      "val_acc": 0.9857142857142858
+    },
+    {
+      "epoch": 9,
+      "train_loss": 0.20674137141969468,
+      "val_loss": 0.23138208048684256,
+      "val_acc": 0.9892857142857143
+    },
+    {
+      "epoch": 10,
+      "train_loss": 0.20630639346819074,
+      "val_loss": 0.23946764043399266,
+      "val_acc": 0.9857142857142858
+    },
+    {
+      "epoch": 11,
+      "train_loss": 0.20634659831486052,
+      "val_loss": 0.24002506732940673,
+      "val_acc": 0.9875
+    },
+    {
+      "epoch": 12,
+      "train_loss": 0.20521626070378318,
+      "val_loss": 0.23575026903833662,
+      "val_acc": 0.9892857142857143
+    },
+    {
+      "epoch": 13,
+      "train_loss": 0.20425036554298703,
+      "val_loss": 0.23416480932916914,
+      "val_acc": 0.9892857142857143
+    }
+  ],
+  "trained_with": "balanced classes, class weights, label smoothing, augmentation, early stopping",
+  "test_accuracy": 0.955
+}

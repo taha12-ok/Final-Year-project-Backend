@@ -1,0 +1,11 @@
+{
+  "fracture": {
+    "temperature": 0.5329
+  },
+  "brain": {
+    "temperature": 0.6964
+  },
+  "kidney": {
+    "temperature": 0.2877
+  }
+}

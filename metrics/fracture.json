@@ -1,0 +1,95 @@
+{
+  "model": "fracture",
+  "architecture": "resnet50",
+  "classes": [
+    "Fractured",
+    "Not Fractured"
+  ],
+  "accuracy": 0.9978,
+  "best_val_accuracy": 0.9978,
+  "per_class_f1": {
+    "Fractured": 0.9978,
+    "Not Fractured": 0.9978
+  },
+  "per_class_f1_by_index": [
+    0.9978,
+    0.9978
+  ],
+  "macro_f1": 0.9978,
+  "confusion_matrix": [
+    [
+      460,
+      1
+    ],
+    [
+      1,
+      463
+    ]
+  ],
+  "temperature": 0.5329,
+  "epochs_run": 10,
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.217724330213806,
+      "val_loss": 0.18146573266467533,
+      "val_acc": 0.9708108108108108
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.1463863384106199,
+      "val_loss": 0.14744982556716815,
+      "val_acc": 0.9881081081081081
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.12909924712136392,
+      "val_loss": 0.13266586527631088,
+      "val_acc": 0.9935135135135135
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.12480974930895161,
+      "val_loss": 0.12997638973029885,
+      "val_acc": 0.9945945945945946
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.12096208124804878,
+      "val_loss": 0.12502547278597548,
+      "val_acc": 0.9967567567567568
+    },
+    {
+      "epoch": 6,
+      "train_loss": 0.12044546178235069,
+      "val_loss": 0.12391620003693812,
+      "val_acc": 0.9978378378378379
+    },
+    {
+      "epoch": 7,
+      "train_loss": 0.11906195495789361,
+      "val_loss": 0.12517550287214485,
+      "val_acc": 0.9978378378378379
+    },
+    {
+      "epoch": 8,
+      "train_loss": 0.11953341600241935,
+      "val_loss": 0.12194260941969381,
+      "val_acc": 0.9978378378378379
+    },
+    {
+      "epoch": 9,
+      "train_loss": 0.11825243314790147,
+      "val_loss": 0.12345053380405581,
+      "val_acc": 0.9967567567567568
+    },
+    {
+      "epoch": 10,
+      "train_loss": 0.1175884995490882,
+      "val_loss": 0.12339576072789528,
+      "val_acc": 0.9978378378378379
+    }
+  ],
+  "trained_with": "balanced classes, class weights, label smoothing, augmentation, early stopping",
+  "test_accuracy": 0.9901
+}

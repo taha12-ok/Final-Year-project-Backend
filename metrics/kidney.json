@@ -1,0 +1,129 @@
+{
+  "model": "kidney",
+  "architecture": "resnet50",
+  "classes": [
+    "Cyst",
+    "Normal",
+    "Stone",
+    "Tumor"
+  ],
+  "accuracy": 1.0,
+  "best_val_accuracy": 1.0,
+  "per_class_f1": {
+    "Cyst": 1.0,
+    "Normal": 1.0,
+    "Stone": 1.0,
+    "Tumor": 1.0
+  },
+  "per_class_f1_by_index": [
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "macro_f1": 1.0,
+  "confusion_matrix": [
+    [
+      371,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      508,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      137,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      229
+    ]
+  ],
+  "temperature": 0.2877,
+  "epochs_run": 12,
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.4308356171920626,
+      "val_loss": 0.27126974733957804,
+      "val_acc": 0.9967871485943776
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.2751634744107843,
+      "val_loss": 0.2625264544324224,
+      "val_acc": 0.9967871485943776
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.26229058898156216,
+      "val_loss": 0.25677367714514215,
+      "val_acc": 0.9983935742971888
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.254954868127611,
+      "val_loss": 0.25445821313972933,
+      "val_acc": 0.9991967871485944
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.2552546287047523,
+      "val_loss": 0.25087638796572703,
+      "val_acc": 0.9983935742971888
+    },
+    {
+      "epoch": 6,
+      "train_loss": 0.2517369867041677,
+      "val_loss": 0.24957411021113873,
+      "val_acc": 0.9975903614457832
+    },
+    {
+      "epoch": 7,
+      "train_loss": 0.2505287844740085,
+      "val_loss": 0.24900474196457,
+      "val_acc": 0.9991967871485944
+    },
+    {
+      "epoch": 8,
+      "train_loss": 0.2465929138392222,
+      "val_loss": 0.24649420433255084,
+      "val_acc": 1.0
+    },
+    {
+      "epoch": 9,
+      "train_loss": 0.2461604908581669,
+      "val_loss": 0.24583799099347678,
+      "val_acc": 1.0
+    },
+    {
+      "epoch": 10,
+      "train_loss": 0.24605503394547215,
+      "val_loss": 0.24579227190898603,
+      "val_acc": 1.0
+    },
+    {
+      "epoch": 11,
+      "train_loss": 0.2461865646094862,
+      "val_loss": 0.24574383683951503,
+      "val_acc": 1.0
+    },
+    {
+      "epoch": 12,
+      "train_loss": 0.2458380866405139,
+      "val_loss": 0.24572871727158266,
+      "val_acc": 1.0
+    }
+  ],
+  "trained_with": "balanced classes, class weights, label smoothing, augmentation, early stopping",
+  "test_accuracy": 1.0
+}
