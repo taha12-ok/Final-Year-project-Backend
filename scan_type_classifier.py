@@ -124,3 +124,29 @@ def classify_scan_type(img: Image.Image) -> Dict[str, Any]:
         "confidence": float(probs[idx]),
         "available": True,
     }
+
+
+# ─────────────────────────────────────────────────────────────
+# Color-saturation guard (defense-in-depth, heuristic)
+# ─────────────────────────────────────────────────────────────
+def saturation_stats(img: Image.Image) -> dict:
+    """Image ka colorfulness measure — colored photos ko scan se pehle hi pakro."""
+    a = np.asarray(img.convert("RGB").resize((256, 256)), dtype=np.float32) / 255.0
+    sat = (a.max(-1) - a.min(-1)) / (a.max(-1) + 1e-6)
+    return {
+        "mean_sat": float(sat.mean()),
+        "p90_sat": float(np.percentile(sat, 90)),
+        "gray_ratio": float((sat < 0.08).mean()),
+    }
+
+
+# Ye threshold tuned hai: real X-ray/MRI/CT me sat ~0 (grayscale scan) hota hai,
+# colored photos (mobile camera) me mean_sat > 0.15 common hai.
+# Note: colored medical overlays (jaise glioma MRI) bhi colored hote hain — isliye
+# ye sirf "photo" rejection me use hota hai jab CNN bhi unsure ho.
+SAT_PHOTO_THRESHOLD = 0.15
+
+
+def looks_like_color_photo(img: Image.Image) -> bool:
+    s = saturation_stats(img)
+    return s["mean_sat"] >= SAT_PHOTO_THRESHOLD

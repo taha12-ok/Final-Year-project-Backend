@@ -37,7 +37,11 @@ from PIL import Image, ImageFile
 import numpy as np
 
 from modality import check_image
-from scan_type_classifier import classify_scan_type, MIN_CONFIDENCE as MIN_CLASSIFIER_CONFIDENCE
+from scan_type_classifier import (
+    classify_scan_type,
+    looks_like_color_photo,
+    MIN_CONFIDENCE as MIN_CLASSIFIER_CONFIDENCE,
+)
 
 # model_type -> CNN modality label (scan_type_classifier.CLASSES)
 MODEL_MODALITY = {"fracture": "xray", "brain": "mri", "kidney": "ct"}
@@ -79,6 +83,12 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 # Config
 # ─────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Inconclusive band: is se neeche confidence pe backend "uncertain" flag deta hai.
+# OOD (bahar ki) images pe model overconfident hota hai — ye honest uncertainty
+# ke liye zaroori hai (MURA val eval: normals ab sahi, lekin confidence high hoti
+# hai — demo me "99% sure galat jawab" se bachne ke liye band rakha gaya hai).
+INCONCLUSIVE_BELOW = float(os.getenv("INCONCLUSIVE_BELOW", "60"))
 if not USE_ONNX:
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 else:
@@ -313,6 +323,41 @@ async def predict(model_type: str, file: UploadFile = File(...)):
 
     # ── GATE 1: kya ye sach me medical scan hai? (CNN classifier, fallback: heuristics) ──
     scan_cls = classify_scan_type(image)
+    # Color/noise guard (CNN se pehle):
+    # 1) Colored image (camera photo / random noise) — scan nahi. EXCEPTION:
+    #    colored medical overlays (glioma MRI) gray_ratio se pehchane jate hain —
+    #    unka colored area chhota hota hai. Colored photo me colored area spread hota hai.
+    # 2) High-frequency speckle (random noise) — laplacian energy scan se 10x zyada.
+    from scan_type_classifier import saturation_stats
+    s_stats = saturation_stats(image)
+    a_small = np.asarray(image.convert("L").resize((256, 256)), dtype=np.float32) / 255.0
+    lap_energy = float(np.abs(
+        4 * a_small[1:-1, 1:-1] - a_small[:-2, 1:-1] - a_small[2:, 1:-1]
+        - a_small[1:-1, :-2] - a_small[1:-1, 2:]
+    ).mean())
+
+    colored_noise = (
+        s_stats["mean_sat"] >= 0.15
+        and s_stats["gray_ratio"] < 0.20   # colored area spread hai (overlay nahi)
+        and lap_energy > 0.05              # smooth colored photo (noise alag se pakra)
+    )
+    speckle_noise = lap_energy > 0.20       # scans ~0.02-0.11, noise ~0.43
+    if colored_noise or speckle_noise:
+        reason = (
+            "This looks like a regular color photo, not a medical scan. "
+            "Please upload a grayscale X-ray, MRI, or CT image."
+            if colored_noise else
+            "This image looks like noise, not a medical scan. "
+            "Please upload a clear X-ray, MRI, or CT image."
+        )
+        raise HTTPException(
+            422,
+            detail={
+                "error": "not_a_scan",
+                "message": reason,
+                "gate": {"score": 0.0, "source": "color_noise_guard"},
+            },
+        )
     if scan_cls.get("available"):
         label = scan_cls["label"]
         if label in ("photo", "other") or (
@@ -380,6 +425,17 @@ async def predict(model_type: str, file: UploadFile = File(...)):
             for i in order[1:4]
         ]
         reliability = evaluate_confidence(confidence)
+        # env-override (INCONCLUSIVE_BELOW) calibration ke 60 default ko replace kare
+        if INCONCLUSIVE_BELOW > 60 and confidence < INCONCLUSIVE_BELOW and not reliability.get("inconclusive"):
+            reliability = {
+                "status": "inconclusive",
+                "inconclusive": True,
+                "message": (
+                    "Model is not confident enough for a reliable screening result. "
+                    "Please try a clearer, properly-exposed scan image — "
+                    "and confirm with a qualified doctor regardless."
+                ),
+            }
     else:
         m = get_model(model_type)
         predicted, confidence, gradcam, alternatives, reliability, temperature = \
