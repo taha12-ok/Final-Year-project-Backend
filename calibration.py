@@ -53,7 +53,12 @@ def load_temperatures(force: bool = False) -> Dict[str, Any]:
 
 
 def get_temperature(model_type: str) -> float:
-    """Model ka learned temperature (na mile to 1.0 = no change)."""
+    """Model ka learned temperature (na mile to 1.0 = no change).
+
+    Floor 1.0: T < 1 confidence SHARPEN karta hai (zyada sure dikhata hai).
+    Validation-set pe tune hua T < 1 OOD (bahar ki) images pe overconfidence
+    badhata hai — isliye kabhi sharpen nahi karte, sirf soften (T >= 1).
+    """
     data = load_temperatures()
     entry = data.get(model_type) or {}
     t = entry.get("temperature", 1.0)
@@ -61,7 +66,7 @@ def get_temperature(model_type: str) -> float:
         t = float(t)
     except (TypeError, ValueError):
         t = 1.0
-    return max(0.5, min(5.0, t))
+    return max(1.0, min(5.0, t))
 
 
 def calibrated_softmax(logits: np.ndarray, temperature: float) -> np.ndarray:
