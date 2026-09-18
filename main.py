@@ -323,6 +323,7 @@ async def predict(model_type: str, file: UploadFile = File(...)):
 
     # ── GATE 1: kya ye sach me medical scan hai? (CNN classifier, fallback: heuristics) ──
     scan_cls = classify_scan_type(image)
+    scan_type_warning = None  # GATE 1b set karega (agar CNN available ho)
     # Color/noise guard (CNN se pehle):
     # 1) Colored image (camera photo / random noise) — scan nahi. EXCEPTION:
     #    colored medical overlays (glioma MRI) gray_ratio se pehchane jate hain —
@@ -336,11 +337,16 @@ async def predict(model_type: str, file: UploadFile = File(...)):
         - a_small[1:-1, :-2] - a_small[1:-1, 2:]
     ).mean())
 
-    colored_noise = (
-        s_stats["mean_sat"] >= 0.15
-        and s_stats["gray_ratio"] < 0.20   # colored area spread hai (overlay nahi)
-        and lap_energy > 0.05              # smooth colored photo (noise alag se pakra)
-    )
+    colored_noise = False
+    if s_stats["mean_sat"] >= 0.15 and s_stats["gray_ratio"] < 0.20 and lap_energy > 0.05:
+        # REAL photos me colored pixels BRIGHT hote hain; X-rays ka blue/dark tint
+        # dark hota hai. Saturated pixels ki brightness check karo.
+        rgb = np.asarray(image.convert("RGB").resize((256, 256)), dtype=np.float32) / 255.0
+        sat = (rgb.max(-1) - rgb.min(-1)) / (rgb.max(-1) + 1e-6)
+        mask = sat >= 0.15
+        bright_colored = float(rgb[..., 0][mask].mean() + rgb[..., 1][mask].mean() + rgb[..., 2][mask].mean()) / 3 if mask.any() else 0.0
+        if bright_colored > 0.30:
+            colored_noise = True
     speckle_noise = lap_energy > 0.20       # scans ~0.02-0.11, noise ~0.43
     if colored_noise or speckle_noise:
         reason = (
@@ -382,22 +388,16 @@ async def predict(model_type: str, file: UploadFile = File(...)):
                     "gate": {"score": scan_cls["confidence"], "source": "cnn_classifier"},
                 },
             )
-        # ── GATE 1b: scan-type model se match karta hai? ──
+        # GATE 1b: scan-type ka BIG mismatch (>=0.90) ab HARD BLOCK nahi —
+        # warning flag bhejo. Internet X-rays ko MRI/CT confusion se block ho
+        # rahi thin (user screenshots); result + warning dono return karte hain.
         expected = entry.get("modality")  # fracture->xray, brain->mri, kidney->ct
-        if expected and label != expected and scan_cls["confidence"] >= 0.80:
-            raise HTTPException(
-                422,
-                detail={
-                    "error": "scan_type_mismatch",
-                    "message": (
-                        f"This looks like a {label.upper()} image, but the "
-                        f"{entry['scan']} analyzer was selected. Please switch to the "
-                        f"correct analyzer or upload a {entry['scan']} image."
-                    ),
-                    "detected": label,
-                    "expected": expected,
-                    "gate": {"score": scan_cls["confidence"], "source": "cnn_classifier"},
-                },
+        scan_type_warning = None
+        if expected and label != expected and scan_cls["confidence"] >= 0.90:
+            scan_type_warning = (
+                f"Heads-up: this image looks like a {label.upper()}, but the "
+                f"{entry['scan']} analyzer was selected. Result may be unreliable "
+                f"— consider switching to the correct analyzer."
             )
         gate = {"passed": True, "score": round(scan_cls["confidence"], 4), "source": "cnn_classifier"}
     else:
@@ -457,6 +457,7 @@ async def predict(model_type: str, file: UploadFile = File(...)):
         "reliability": reliability,
         "calibration": {"temperature": temperature},
         "modality_gate": {"score": gate["score"], "source": gate["source"]},
+        "scan_type_warning": scan_type_warning,
         "scan_type": entry["scan"],
     }
 
