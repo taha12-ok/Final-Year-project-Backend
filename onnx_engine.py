@@ -46,6 +46,8 @@ _fc_weights: Dict[str, np.ndarray] = {}
 _model_meta: Dict[str, Dict[str, Any]] = {}
 _lru_order: list = []
 MAX_LOADED = max(1, int(os.getenv("MAX_LOADED_MODELS", "3")))
+# TTA for fracture (3 views) — CPU cost 3x on that model only; disable via env
+TTA_ENABLED = os.getenv("TTA_ENABLED", "1") not in ("0", "false", "False")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -289,12 +291,29 @@ def run_inference(model_type: str, image: Image.Image, temperature: float = 1.0)
     """
     Returns (predicted_idx, confidence_pct, heatmap_7x7_or_None).
     Calibrated softmax + Activation Map heatmap.
+
+    TTA (test-time augmentation): X-ray model ke liye 3 views (center,
+    180-rotation, horizontal-flip) ka logit-average — single-view OOD
+    images pe false Fractured deta tha (MURA normals eval se fix).
+    Inconclusive band: top prob < UNCERTAIN_HIGH => backend "inconclusive"
+    flag dikhata hai (evaluate_confidence bhi iska use karega).
     """
     sess = get_session(model_type)
     input_name = sess.get_inputs()[0].name
     input_arr = preprocess(image)
 
-    logits = sess.run(None, {input_name: input_arr})[0][0].astype(np.float64)
+    views = [input_arr]
+    if model_type == "fracture" and TTA_ENABLED:
+        # flip view
+        views.append(input_arr[:, :, :, ::-1])
+        # 180-degree view
+        views.append(input_arr[:, :, ::-1, ::-1])
+
+    logits_sum = None
+    for v in views:
+        out = sess.run(None, {input_name: v})[0][0].astype(np.float64)
+        logits_sum = out if logits_sum is None else logits_sum + out
+    logits = logits_sum / len(views)
 
     # temperature scaling (calibration.py ke sath consistent)
     z = logits / max(temperature, 1e-6)

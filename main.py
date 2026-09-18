@@ -360,8 +360,16 @@ async def predict(model_type: str, file: UploadFile = File(...)):
         )
     if scan_cls.get("available"):
         label = scan_cls["label"]
-        if label in ("photo", "other") or (
-            label == "unknown" and scan_cls["confidence"] < MIN_CLASSIFIER_CONFIDENCE
+        # Sirf CONFIDENT photo/other reject karo (>=0.65). Unsure cases (conf ~0.5)
+        # pass karne do — warna real X-rays/MRIs false-reject hote the (MURA eval).
+        # Garbage jo pass ho jaye wo inconclusive-band me pakda jayega.
+        # EXCEPTION: fully-grayscale images kabhi "photo" nahi — MURA jaisi
+        # white-background X-rays CNN ko confuse karti thin (0.66-0.80 photo).
+        is_grayscale_img = s_stats["mean_sat"] < 0.05
+        if (
+            label in ("photo", "other")
+            and scan_cls["confidence"] >= 0.65
+            and not is_grayscale_img
         ):
             raise HTTPException(
                 422,
@@ -376,7 +384,7 @@ async def predict(model_type: str, file: UploadFile = File(...)):
             )
         # ── GATE 1b: scan-type model se match karta hai? ──
         expected = entry.get("modality")  # fracture->xray, brain->mri, kidney->ct
-        if expected and label != expected and scan_cls["confidence"] >= 0.75:
+        if expected and label != expected and scan_cls["confidence"] >= 0.80:
             raise HTTPException(
                 422,
                 detail={
