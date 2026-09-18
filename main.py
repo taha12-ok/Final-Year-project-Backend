@@ -331,7 +331,7 @@ async def predict(model_type: str, file: UploadFile = File(...)):
             )
         # ── GATE 1b: scan-type model se match karta hai? ──
         expected = entry.get("modality")  # fracture->xray, brain->mri, kidney->ct
-        if expected and label != expected and scan_cls["confidence"] >= 0.70:
+        if expected and label != expected and scan_cls["confidence"] >= 0.75:
             raise HTTPException(
                 422,
                 detail={
