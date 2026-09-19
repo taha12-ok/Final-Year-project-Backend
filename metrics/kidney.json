@@ -48,64 +48,70 @@
       229
     ]
   ],
-  "temperature": 0.2894,
-  "epochs_run": 9,
+  "temperature": 0.2893,
+  "epochs_run": 10,
   "history": [
     {
       "epoch": 1,
-      "train_loss": 0.432439954058623,
-      "val_loss": 0.2773113448457067,
-      "val_acc": 0.98714859437751
+      "train_loss": 0.4291540635499,
+      "val_loss": 0.28438836144635,
+      "val_acc": 0.9919678714859438
     },
     {
       "epoch": 2,
-      "train_loss": 0.27413050240663794,
-      "val_loss": 0.25316603755855177,
-      "val_acc": 0.9991967871485944
+      "train_loss": 0.28078135437350427,
+      "val_loss": 0.26839995781580606,
+      "val_acc": 0.9927710843373494
     },
     {
       "epoch": 3,
-      "train_loss": 0.2603607628780371,
-      "val_loss": 0.24988029836172082,
-      "val_acc": 0.9991967871485944
+      "train_loss": 0.26500082971485517,
+      "val_loss": 0.26628974920295806,
+      "val_acc": 0.9967871485943776
     },
     {
       "epoch": 4,
-      "train_loss": 0.25656390621174574,
-      "val_loss": 0.25133607186466816,
+      "train_loss": 0.2624475578554858,
+      "val_loss": 0.25326266183431845,
       "val_acc": 0.9991967871485944
     },
     {
       "epoch": 5,
-      "train_loss": 0.2540783052369743,
-      "val_loss": 0.2502272418943275,
-      "val_acc": 1.0
+      "train_loss": 0.2557758892777456,
+      "val_loss": 0.24909448642807314,
+      "val_acc": 0.9991967871485944
     },
     {
       "epoch": 6,
-      "train_loss": 0.2539459900139517,
-      "val_loss": 0.24874727615869668,
+      "train_loss": 0.2504669695362215,
+      "val_loss": 0.2472500201688713,
       "val_acc": 1.0
     },
     {
       "epoch": 7,
-      "train_loss": 0.25027829217067826,
-      "val_loss": 0.24649263766395998,
-      "val_acc": 1.0
+      "train_loss": 0.25085003820707064,
+      "val_loss": 0.2488713221617013,
+      "val_acc": 0.9991967871485944
     },
     {
       "epoch": 8,
-      "train_loss": 0.24746137896950057,
-      "val_loss": 0.24657874375462052,
+      "train_loss": 0.24841953710457942,
+      "val_loss": 0.2459606770530762,
       "val_acc": 1.0
     },
     {
       "epoch": 9,
-      "train_loss": 0.24633925835882242,
-      "val_loss": 0.245864059408027,
+      "train_loss": 0.2471320980365806,
+      "val_loss": 0.24630283390183047,
+      "val_acc": 1.0
+    },
+    {
+      "epoch": 10,
+      "train_loss": 0.24727225203670236,
+      "val_loss": 0.2458231626744251,
       "val_acc": 1.0
     }
   ],
   "trained_with": "balanced classes, class weights, label smoothing, augmentation, early stopping",
-  "test_accuracy": 0.9968
+  "test_accuracy": 0.9992
 }
