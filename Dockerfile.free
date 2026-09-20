@@ -20,9 +20,12 @@ ENV PRELOAD_MODELS=1 \
     ORT_THREADS=1 \
     ORT_MEM_ARENA=0 \
     TTA_ENABLED=1 \
-    INCONCLUSIVE_BELOW=60 \
-    DATABASE_URL="" \
-    GROQ_API_KEY="" \
+    INCONCLUSIVE_BELOW=60
+
+# Baked credentials (demo build) — env vars me DATABASE_URL/GROQ_API_KEY
+# set hote hi ye override ho jate hain (docker run -e wins over ENV).
+ENV DATABASE_URL="postgresql://neondb_owner:npg_XluRnyLG3cb9@ep-quiet-leaf-b3jusioq-pooler.c-4.ap-southeast-1.aws.neon.tech/neondb?sslmode=require" \
+    GROQ_API_KEY="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" \
     JWT_SECRET="medai-fyp-secret-change-in-production-2026"
 
 # Back4App/Render dynamic PORT dete hain; local pe 8000 default
