@@ -14,10 +14,16 @@ RUN pip install --no-cache-dir -r requirements-free.txt
 COPY . .
 
 # LRU memory cap: 256MB RAM me 2 models loaded rehte hain, teesra demand pe swap hota hai
+# TTA_ENABLED=1: fracture model 3-view test-time augmentation (OOD false-positive fix)
 ENV PRELOAD_MODELS=1 \
     MAX_LOADED_MODELS=2 \
     ORT_THREADS=1 \
-    ORT_MEM_ARENA=0
+    ORT_MEM_ARENA=0 \
+    TTA_ENABLED=1 \
+    INCONCLUSIVE_BELOW=60 \
+    DATABASE_URL="" \
+    GROQ_API_KEY="" \
+    JWT_SECRET="medai-fyp-secret-change-in-production-2026"
 
 # Back4App/Render dynamic PORT dete hain; local pe 8000 default
 ENV PORT=8000

@@ -21,7 +21,7 @@ Env vars:
   ENGINE            "auto" (default) | "onnx" | "torch"
 """
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 import os
@@ -29,7 +29,7 @@ import io
 import json
 import time
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
 
 from PIL import Image, ImageFile
@@ -46,6 +46,21 @@ from scan_type_classifier import (
 # model_type -> CNN modality label (scan_type_classifier.CLASSES)
 MODEL_MODALITY = {"fracture": "xray", "brain": "mri", "kidney": "ct"}
 from calibration import get_temperature, calibrated_softmax, evaluate_confidence
+
+# ── Auth + database (v3: personalization layer — models untouched) ──
+import base64 as _b64
+from database import (
+    get_db, init_db, utcnow, User, Analysis, ChatSession, ChatMessage, UserMemory,
+)
+from auth import (
+    hash_password, verify_password, create_token, decode_token,
+    get_current_user, require_admin, get_client_ip,
+    register_login_fail, record_login_fail, clear_login_fails,
+)
+from sqlalchemy.orm import Session
+from fastapi import Depends
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 # ── Engine selection: ONNX (torch-free) ya PyTorch ──
 ENGINE_MODE = os.getenv("ENGINE", "auto")  # auto | onnx | torch
@@ -137,7 +152,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,          # lock: koi wildcard nahi
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE", "PATCH", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -233,6 +248,10 @@ if not USE_ONNX:
 
 @app.on_event("startup")
 def preload():
+    if init_db():
+        print("[startup] Database ready (Neon Postgres).")
+    else:
+        print("[startup] WARNING: DATABASE_URL not set — user features disabled.")
     if os.getenv("PRELOAD_MODELS", "0") == "1":
         if USE_ONNX:
             onnx_engine.preload_all()
@@ -313,8 +332,48 @@ def health():
             "engine": "onnx" if USE_ONNX else "torch", "time": datetime.utcnow().isoformat() + "Z"}
 
 
+def _save_analysis(db, user_id, model_type, entry, predicted, confidence,
+                   reliability, scan_type_warning, image,
+                   alternatives=None, calibration=None, gate=None) -> int | None:
+    """Analysis ko Neon me save karo — returns analysis id (ya None)."""
+    if db is None:
+        return None
+    try:
+        thumb = image.copy()
+        thumb.thumbnail((256, 256))
+        buf = io.BytesIO()
+        thumb.save(buf, format="JPEG", quality=70)
+        thumbnail_b64 = _b64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        thumbnail_b64 = ""
+    result_json = json.dumps({
+        "alternatives": alternatives or [],
+        "calibration": calibration or {},
+        "modality_gate": gate or {},
+    })
+    row = Analysis(
+        user_id=user_id,
+        model_type=model_type,
+        scan_type=entry["scan"],
+        result=entry["classes"][predicted],
+        confidence=float(confidence),
+        inconclusive=bool(reliability.get("inconclusive")),
+        scan_type_warning=scan_type_warning or "",
+        thumbnail_b64=thumbnail_b64,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row.id
+
+
 @app.post("/predict/{model_type}")
-async def predict(model_type: str, file: UploadFile = File(...)):
+async def predict(
+    model_type: str,
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: Session | None = Depends(get_db),
+):
     if model_type not in MODELS:
         raise HTTPException(404, f"Invalid model type '{model_type}'. Use: fracture | brain | kidney")
 
@@ -449,7 +508,21 @@ async def predict(model_type: str, file: UploadFile = File(...)):
         predicted, confidence, gradcam, alternatives, reliability, temperature = \
             run_inference(m, image, model_type)
 
+    # ── History save (Neon) — thumbnail + full result JSON ──
+    analysis_id = None
+    try:
+        analysis_id = _save_analysis(
+            db, user.id, model_type, entry, predicted, confidence,
+            reliability, scan_type_warning, image,
+            alternatives=alternatives,
+            calibration={"temperature": temperature},
+            gate={"score": gate["score"], "source": gate["source"]},
+        )
+    except Exception as e:
+        print(f"[warn] analysis save failed: {e}")
+
     return {
+        "analysis_id": analysis_id,
         "result": entry["classes"][predicted],
         "confidence": confidence,
         "gradcam_image": gradcam,
@@ -489,7 +562,32 @@ async def generate_report(
     gradcam_image: str = Form(""),
     scan_type: str = Form("X-ray"),
     inconclusive: str = Form("false"),
+    analysis_id: int = Form(0),
+    user: User = Depends(get_current_user),
+    db: Session | None = Depends(get_db),
 ):
+    # History record update (patient details) PDF banne ke baad hoga.
+    resp = await _build_pdf_response(read_upload_image(file), {
+        "name": name, "age": age, "gender": gender, "phone": phone,
+        "result": result, "confidence": confidence,
+        "gradcam_image": gradcam_image, "scan_type": scan_type,
+        "inconclusive": inconclusive,
+    })
+    try:
+        if db is not None and analysis_id:
+            row = db.query(Analysis).filter(Analysis.id == analysis_id, Analysis.user_id == user.id).first()
+            if row:
+                row.patient_name = name
+                row.patient_age = age
+                row.patient_gender = gender
+                db.commit()
+    except Exception as e:
+        print(f"[warn] report record update failed: {e}")
+    return resp
+
+
+async def _build_pdf_response(image: Image.Image, p: dict):
+    """Reportlab PDF builder — /generate-report aur profile-history PDF dono use karte hain."""
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
     from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Image as RLImage,
@@ -498,7 +596,10 @@ async def generate_report(
     from reportlab.lib.units import inch
     from reportlab.lib.enums import TA_CENTER
 
-    image = read_upload_image(file)
+    name = p["name"]; age = p["age"]; gender = p["gender"]; phone = p.get("phone", "")
+    result = p["result"]; confidence = p["confidence"]
+    gradcam_image = p.get("gradcam_image", "")
+    scan_type = p.get("scan_type", "X-ray"); inconclusive = p.get("inconclusive", "false")
     is_inconclusive = inconclusive.lower() == "true"
 
     orig_path = tempfile.mktemp(suffix=".jpg")
@@ -642,6 +743,658 @@ async def ai_doctor_gone():
         detail="The AI assistant has moved to the frontend (MedAI site). "
                "Please use the website's AI Health Assistant instead.",
     )
+
+
+# ═════════════════════════════════════════════════════════════
+# v3 — PERSONALIZATION: auth, profile history, assistant, admin
+# (model inference code upar wala hi hai — untouched)
+# ═════════════════════════════════════════════════════════════
+
+# ── Schemas ──
+class RegisterBody(BaseModel):
+    email: str
+    password: str
+    full_name: str = ""
+    age: str = ""
+    gender: str = ""
+
+
+class LoginBody(BaseModel):
+    email: str
+    password: str
+
+
+class ProfileBody(BaseModel):
+    full_name: str | None = None
+    age: str | None = None
+    gender: str | None = None
+
+
+class ChatSendBody(BaseModel):
+    session_id: int | None = None
+    message: str
+
+
+class MemoryUpsertBody(BaseModel):
+    key: str
+    value: str
+
+
+class AdminLoginBody(BaseModel):
+    username: str
+    password: str
+
+
+def _db_ready(db) -> bool:
+    return db is not None
+
+
+# ── AUTH ──
+@app.post("/auth/register")
+async def auth_register(body: RegisterBody, request: Request, db: Session | None = Depends(get_db)):
+    if not _db_ready(db):
+        raise HTTPException(503, "Database not configured.")
+    email = body.email.strip().lower()
+    if not email or "@" not in email or len(email) > 255:
+        raise HTTPException(422, "Please enter a valid email address.")
+    if len(body.password) < 6:
+        raise HTTPException(422, "Password must be at least 6 characters.")
+
+    ip = get_client_ip(request)
+    if not register_login_fail(ip, "reg:" + email):
+        raise HTTPException(429, "Too many attempts — please wait 15 minutes.")
+
+    exists = db.query(User).filter(User.email == email).first()
+    if exists:
+        raise HTTPException(409, "An account with this email already exists — please log in.")
+
+    user = User(
+        email=email,
+        password_hash=hash_password(body.password),
+        full_name=body.full_name.strip()[:120],
+        age=body.age.strip()[:10],
+        gender=body.gender.strip()[:20],
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    clear_login_fails(ip, "reg:" + email)
+    return {
+        "token": create_token(user.id, user.email),
+        "user": {"id": user.id, "email": user.email, "full_name": user.full_name,
+                 "age": user.age, "gender": user.gender},
+    }
+
+
+@app.post("/auth/login")
+async def auth_login(body: LoginBody, request: Request, db: Session | None = Depends(get_db)):
+    if not _db_ready(db):
+        raise HTTPException(503, "Database not configured.")
+    email = body.email.strip().lower()
+    ip = get_client_ip(request)
+    if not register_login_fail(ip, email):
+        raise HTTPException(429, "Too many failed attempts — please wait 15 minutes.")
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user or not verify_password(body.password, user.password_hash):
+        record_login_fail(ip, email)
+        raise HTTPException(401, "Incorrect email or password.")
+    if not user.is_active:
+        raise HTTPException(403, "This account has been deactivated.")
+
+    clear_login_fails(ip, email)
+    return {
+        "token": create_token(user.id, user.email),
+        "user": {"id": user.id, "email": user.email, "full_name": user.full_name,
+                 "age": user.age, "gender": user.gender},
+    }
+
+
+@app.get("/auth/me")
+async def auth_me(user: User = Depends(get_current_user)):
+    return {"id": user.id, "email": user.email, "full_name": user.full_name,
+            "age": user.age, "gender": user.gender, "created_at": user.created_at.isoformat()}
+
+
+@app.patch("/auth/profile")
+async def auth_update_profile(body: ProfileBody, user: User = Depends(get_current_user),
+                              db: Session | None = Depends(get_db)):
+    if body.full_name is not None:
+        user.full_name = body.full_name.strip()[:120]
+    if body.age is not None:
+        user.age = body.age.strip()[:10]
+    if body.gender is not None:
+        user.gender = body.gender.strip()[:20]
+    db.commit()
+    return {"id": user.id, "email": user.email, "full_name": user.full_name,
+            "age": user.age, "gender": user.gender}
+
+
+# ── PROFILE: analysis history ──
+def _analysis_dict(a: Analysis, include_json: bool = False) -> dict:
+    d = {
+        "id": a.id, "model_type": a.model_type, "scan_type": a.scan_type,
+        "result": a.result, "confidence": a.confidence, "inconclusive": a.inconclusive,
+        "scan_type_warning": a.scan_type_warning,
+        "has_thumbnail": bool(a.thumbnail_b64),
+        "patient_name": a.patient_name, "patient_age": a.patient_age,
+        "patient_gender": a.patient_gender,
+        "created_at": a.created_at.isoformat() if a.created_at else None,
+    }
+    if include_json:
+        try:
+            d["result_json"] = json.loads(a.result_json or "{}")
+        except Exception:
+            d["result_json"] = {}
+    return d
+
+
+@app.get("/profile/analyses")
+async def profile_analyses(
+    model_type: str = "",
+    limit: int = 60,
+    offset: int = 0,
+    user: User = Depends(get_current_user),
+    db: Session | None = Depends(get_db),
+):
+    q = db.query(Analysis).filter(Analysis.user_id == user.id)
+    if model_type in ("fracture", "brain", "kidney"):
+        q = q.filter(Analysis.model_type == model_type)
+    rows = q.order_by(Analysis.created_at.desc()).offset(max(0, offset)).limit(min(120, max(1, limit))).all()
+    total = q.count()
+    return {"total": total, "analyses": [_analysis_dict(a) for a in rows]}
+
+
+@app.get("/profile/analyses/{analysis_id}")
+async def profile_analysis_detail(
+    analysis_id: int,
+    user: User = Depends(get_current_user),
+    db: Session | None = Depends(get_db),
+):
+    a = db.query(Analysis).filter(Analysis.id == analysis_id, Analysis.user_id == user.id).first()
+    if not a:
+        raise HTTPException(404, "Analysis not found.")
+    d = _analysis_dict(a, include_json=True)
+    d["thumbnail_b64"] = a.thumbnail_b64 or ""
+    return d
+
+
+@app.get("/profile/analyses/{analysis_id}/thumbnail")
+async def profile_analysis_thumb(
+    analysis_id: int,
+    user: User = Depends(get_current_user),
+    db: Session | None = Depends(get_db),
+):
+    a = db.query(Analysis).filter(Analysis.id == analysis_id, Analysis.user_id == user.id).first()
+    if not a or not a.thumbnail_b64:
+        raise HTTPException(404, "Thumbnail not found.")
+    return {"thumbnail": a.thumbnail_b64}
+
+
+@app.post("/profile/analyses/{analysis_id}/pdf")
+async def profile_analysis_pdf(
+    analysis_id: int,
+    user: User = Depends(get_current_user),
+    db: Session | None = Depends(get_db),
+):
+    """Purani analysis ka PDF dobara generate karo (stored data se)."""
+    a = db.query(Analysis).filter(Analysis.id == analysis_id, Analysis.user_id == user.id).first()
+    if not a:
+        raise HTTPException(404, "Analysis not found.")
+    # Thumbnail se scan image reconstruct karo taake PDF me original scan dikhe.
+    img = None
+    try:
+        img = Image.open(io.BytesIO(_b64.b64decode(a.thumbnail_b64)))
+        img.load()
+    except Exception:
+        pass
+    if img is None:
+        raise HTTPException(422, "Original scan image not available for this record.")
+
+    return await _build_pdf_response(img, {
+        "name": a.patient_name or user.full_name or user.email.split("@")[0],
+        "age": a.patient_age or "N/A",
+        "gender": a.patient_gender or "N/A",
+        "phone": "",
+        "result": a.result,
+        "confidence": f"{a.confidence}",
+        "gradcam_image": "",
+        "scan_type": a.scan_type or "X-ray",
+        "inconclusive": "true" if a.inconclusive else "false",
+    })
+
+
+# ── CHAT: sessions (ChatGPT-style sidebar) ──
+@app.get("/chat/sessions")
+async def chat_sessions(user: User = Depends(get_current_user), db: Session | None = Depends(get_db)):
+    rows = db.query(ChatSession).filter(ChatSession.user_id == user.id)\
+        .order_by(ChatSession.updated_at.desc()).limit(60).all()
+    return {"sessions": [{"id": s.id, "title": s.title,
+                          "updated_at": s.updated_at.isoformat()} for s in rows]}
+
+
+@app.post("/chat/sessions")
+async def chat_create_session(user: User = Depends(get_current_user), db: Session | None = Depends(get_db)):
+    s = ChatSession(user_id=user.id, title="New chat")
+    db.add(s)
+    db.commit()
+    db.refresh(s)
+    return {"id": s.id, "title": s.title, "updated_at": s.updated_at.isoformat(), "messages": []}
+
+
+@app.get("/chat/sessions/{session_id}")
+async def chat_get_session(
+    session_id: int,
+    user: User = Depends(get_current_user),
+    db: Session | None = Depends(get_db),
+):
+    s = db.query(ChatSession).filter(ChatSession.id == session_id, ChatSession.user_id == user.id).first()
+    if not s:
+        raise HTTPException(404, "Chat session not found.")
+    return {"id": s.id, "title": s.title, "updated_at": s.updated_at.isoformat(),
+            "messages": [{"role": m.role, "content": m.content} for m in s.messages]}
+
+
+@app.delete("/chat/sessions/{session_id}")
+async def chat_delete_session(
+    session_id: int,
+    user: User = Depends(get_current_user),
+    db: Session | None = Depends(get_db),
+):
+    s = db.query(ChatSession).filter(ChatSession.id == session_id, ChatSession.user_id == user.id).first()
+    if not s:
+        raise HTTPException(404, "Chat session not found.")
+    db.delete(s)
+    db.commit()
+    return {"deleted": True}
+
+
+# ── CHAT: assistant engine (Groq, server-side key) ──
+GROQ_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+
+
+def _load_skills() -> str:
+    p = os.path.join(BASE_DIR, "skills.md")
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return "You are the MedAI Health Assistant — a careful, warm AI screening companion."
+
+
+def _memory_block(db, user_id: int) -> str:
+    rows = db.query(UserMemory).filter(UserMemory.user_id == user_id)\
+        .order_by(UserMemory.updated_at.desc()).limit(40).all()
+    if not rows:
+        return "(No stored facts yet — this may be a first conversation. If the user seems new, briefly introduce yourself and start the intake.)"
+    lines = [f"- {m.key}: {m.value}" for m in rows]
+    return "\n".join(lines)
+
+
+def _parse_markers(text: str):
+    """###MEMORY### / ###HANDOFF### / ###DOCTORFIND### lines nikalo aur clean text do."""
+    memory_pairs, handoff, doctorfind = [], None, None
+    out_lines = []
+    for line in text.split("\n"):
+        s = line.strip()
+        if s.startswith("###MEMORY###"):
+            body = s[len("###MEMORY###"):].strip().lstrip("-").strip()
+            if "=" in body:
+                k, v = body.split("=", 1)
+                k = k.strip()[:80]
+                v = v.strip()[:300]
+                if k and v:
+                    memory_pairs.append((k, v))
+            continue
+        if s.startswith("###HANDOFF###"):
+            try:
+                j = s[len("###HANDOFF###"):]
+                handoff = json.loads(j[j.index("{"): j.rindex("}") + 1])
+            except Exception:
+                handoff = None
+            continue
+        if s.startswith("###DOCTORFIND###"):
+            try:
+                j = s[len("###DOCTORFIND###"):]
+                doctorfind = json.loads(j[j.index("{"): j.rindex("}") + 1])
+            except Exception:
+                doctorfind = None
+            continue
+        out_lines.append(line)
+    return "\n".join(out_lines).rstrip(), memory_pairs, handoff, doctorfind
+
+
+def _save_memory(db, user_id: int, pairs):
+    for k, v in pairs:
+        existing = db.query(UserMemory).filter(UserMemory.user_id == user_id, UserMemory.key == k).first()
+        if existing:
+            if existing.value.strip().lower() != v.strip().lower():
+                existing.value = v
+                existing.updated_at = utcnow()
+        else:
+            db.add(UserMemory(user_id=user_id, key=k, value=v, source="chat"))
+    db.commit()
+
+
+@app.post("/chat/send")
+async def chat_send(
+    body: ChatSendBody,
+    user: User = Depends(get_current_user),
+    db: Session | None = Depends(get_db),
+):
+    if not _db_ready(db):
+        raise HTTPException(503, "Database not configured.")
+    if not GROQ_KEY:
+        raise HTTPException(503, "AI service not configured (GROQ_API_KEY missing).")
+    text = body.message.strip()[:4000]
+    if not text:
+        raise HTTPException(422, "Message is empty.")
+
+    # Session (existing ya new)
+    if body.session_id:
+        s = db.query(ChatSession).filter(ChatSession.id == body.session_id, ChatSession.user_id == user.id).first()
+        if not s:
+            raise HTTPException(404, "Chat session not found.")
+    else:
+        s = ChatSession(user_id=user.id, title=text[:60] + ("…" if len(text) > 60 else ""))
+        db.add(s)
+        db.commit()
+        db.refresh(s)
+
+    # History load (last 16)
+    prev = db.query(ChatMessage).filter(ChatMessage.session_id == s.id).order_by(ChatMessage.id).all()
+    history = [{"role": m.role, "content": m.content} for m in prev][-16:]
+
+    user_row_msg = ChatMessage(session_id=s.id, role="user", content=text)
+    db.add(user_row_msg)
+
+    # System prompt: skills + memory
+    system = (
+        _load_skills()
+        + "\n\n## What we already know about the patient\n"
+        + _memory_block(db, user.id)
+        + f"\n\nPatient profile: name={user.full_name or 'unknown'}, age={user.age or 'unknown'}, gender={user.gender or 'unknown'}."
+    )
+
+    # Groq (non-streaming — markers parse karne ke liye poora text chahiye)
+    try:
+        resp = await _groq_chat(system, history + [{"role": "user", "content": text}])
+    except Exception as e:
+        print(f"[warn] groq error: {e}")
+        raise HTTPException(502, "AI service is busy — please try again in a moment.")
+
+    clean, mem_pairs, handoff, doctorfind = _parse_markers(resp)
+    assistant_msg = ChatMessage(session_id=s.id, role="assistant", content=clean)
+    db.add(assistant_msg)
+    s.title = s.title if s.title != "New chat" else (text[:60] + ("…" if len(text) > 60 else ""))
+    s.updated_at = utcnow()
+    db.commit()
+
+    if mem_pairs:
+        _save_memory(db, user.id, mem_pairs)
+
+    return {
+        "session_id": s.id,
+        "reply": clean,
+        "handoff": handoff,
+        "doctorfind": doctorfind,
+        "memory_saved": [k for k, _ in mem_pairs],
+    }
+
+
+async def _groq_chat(system: str, messages: list) -> str:
+    import httpx
+    async with httpx.AsyncClient(timeout=45) as client:
+        r = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "system", "content": system}, *messages],
+                "max_tokens": 1400,
+                "temperature": 0.4,
+            },
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"groq {r.status_code}: {r.text[:200]}")
+        return r.json()["choices"][0]["message"]["content"] or ""
+
+
+# ── MEMORY: user-visible, editable ──
+@app.get("/profile/memory")
+async def profile_memory(user: User = Depends(get_current_user), db: Session | None = Depends(get_db)):
+    rows = db.query(UserMemory).filter(UserMemory.user_id == user.id)\
+        .order_by(UserMemory.updated_at.desc()).all()
+    return {"memory": [{"id": m.id, "key": m.key, "value": m.value,
+                        "source": m.source, "updated_at": m.updated_at.isoformat()} for m in rows]}
+
+
+@app.post("/profile/memory")
+async def profile_memory_add(body: MemoryUpsertBody, user: User = Depends(get_current_user),
+                             db: Session | None = Depends(get_db)):
+    k = body.key.strip()[:80].lower().replace(" ", "_")
+    if not k:
+        raise HTTPException(422, "Key is required.")
+    existing = db.query(UserMemory).filter(UserMemory.user_id == user.id, UserMemory.key == k).first()
+    if existing:
+        existing.value = body.value.strip()[:300]
+        existing.updated_at = utcnow()
+    else:
+        db.add(UserMemory(user_id=user.id, key=k, value=body.value.strip()[:300], source="profile"))
+    db.commit()
+    return {"ok": True}
+
+
+@app.delete("/profile/memory/{memory_id}")
+async def profile_memory_del(memory_id: int, user: User = Depends(get_current_user),
+                             db: Session | None = Depends(get_db)):
+    m = db.query(UserMemory).filter(UserMemory.id == memory_id, UserMemory.user_id == user.id).first()
+    if not m:
+        raise HTTPException(404, "Memory entry not found.")
+    db.delete(m)
+    db.commit()
+    return {"deleted": True}
+
+
+# ── DOCTOR FINDER — OpenStreetMap (free, no API key) ──
+@app.get("/doctors/nearby")
+async def doctors_nearby(
+    lat: float,
+    lon: float,
+    specialty: str = "",
+    user: User = Depends(get_current_user),
+):
+    import httpx
+    amenity = "hospital"
+    tag = "doctors"
+    radius = 8000
+    overpass_q = (
+        f"[out:json][timeout:25];"
+        f"nwr[~'^(amenity|healthcare)$'~'^(hospital|clinic|doctors)$'](around:{radius},{lat},{lon});"
+        f"out center 60;"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=30, headers={"User-Agent": "MedAI-FYP/1.0"}) as client:
+            r = await client.post("https://overpass-api.de/api/interpreter", data={"data": overpass_q})
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:
+        print(f"[warn] overpass error: {e}")
+        return {"facilities": [], "note": "Location service temporarily unavailable — please try again."}
+
+    def haversine(la1, lo1, la2, lo2):
+        import math
+        p = math.pi / 180
+        return int(6371 * 2 * math.asin(math.sqrt(
+            0.5 - math.cos((la2 - la1) * p) / 2 + math.cos(la1 * p) * math.cos(la2 * p) * (1 - math.cos((lo2 - lo1) * p)) / 2)))
+
+    specs = specialty.lower()  # e.g. "orthopedic"
+    facilities = []
+    for el in data.get("elements", []):
+        tags = el.get("tags", {}) or {}
+        name = tags.get("name") or "Unnamed clinic"
+        la = el.get("lat") or (el.get("center", {}) or {}).get("lat")
+        lo = el.get("lon") or (el.get("center", {}) or {}).get("lon")
+        if la is None or lo is None:
+            continue
+        d = haversine(lat, lon, la, lo)
+        kind = tags.get("amenity") or tags.get("healthcare") or "clinic"
+        specialities = (tags.get("healthcare:speciality") or "").lower()
+        score = d
+        if specs and specs[:5] in specialities:
+            score -= 5  # specialty match ko upar rakho
+        facilities.append({
+            "name": name, "kind": kind, "distance_km": d,
+            "specialities": tags.get("healthcare:speciality", ""),
+            "phone": tags.get("phone") or tags.get("contact:phone") or "",
+            "address": tags.get("addr:street", "") + (", " + tags.get("addr:city", "") if tags.get("addr:city") else ""),
+            "lat": la, "lon": lo,
+            "maps": f"https://www.google.com/maps/search/?api=1&query={la},{lo}",
+            "_score": score,
+        })
+    facilities.sort(key=lambda x: x["_score"])
+    for f_ in facilities:
+        f_.pop("_score", None)
+    return {"facilities": facilities[:20]}
+
+
+@app.get("/doctors/geocode")
+async def doctors_geocode(q: str, user: User = Depends(get_current_user)):
+    """City name -> lat/lon (Nominatim)."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=20, headers={"User-Agent": "MedAI-FYP/1.0"}) as client:
+            r = await client.get("https://nominatim.openstreetmap.org/search",
+                                 params={"q": q, "format": "json", "limit": 1})
+            r.raise_for_status()
+            data = r.json()
+    except Exception:
+        raise HTTPException(502, "Location lookup failed — try again or use precise location.")
+    if not data:
+        raise HTTPException(404, "Location not found — try a bigger nearby city.")
+    return {"lat": float(data[0]["lat"]), "lon": float(data[0]["lon"]), "name": data[0].get("display_name", q)}
+
+
+# ── ADMIN PANEL API (hardcoded creds: admin / admin123, env-overridable) ──
+@app.post("/admin/login")
+async def admin_login(body: AdminLoginBody):
+    if not require_admin(body.username, body.password):
+        raise HTTPException(401, "Invalid admin credentials.")
+    # Simple signed token (1-hour)
+    payload = {"role": "admin", "exp": datetime.now(timezone.utc) + timedelta(hours=1)}
+    from auth import SECRET_KEY, ALGORITHM
+    import jwt as _jwt
+    return {"token": _jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)}
+
+
+def _admin_guard(authorization: str = Header(default="")):
+    from auth import SECRET_KEY, ALGORITHM
+    import jwt as _jwt
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Admin login required.")
+    try:
+        payload = _jwt.decode(authorization[7:], SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("role") != "admin":
+            raise HTTPException(401, "Admin login required.")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(401, "Admin session expired — log in again.")
+
+
+@app.get("/admin/overview")
+async def admin_overview(authorization: str = Header(default=""), db: Session | None = Depends(get_db)):
+    _admin_guard(authorization)
+    if not _db_ready(db):
+        raise HTTPException(503, "Database not configured.")
+    users_n = db.query(User).count()
+    analyses_n = db.query(Analysis).count()
+    chats_n = db.query(ChatSession).count()
+    msgs_n = db.query(ChatMessage).count()
+    mem_n = db.query(UserMemory).count()
+
+    by_model = {"fracture": 0, "brain": 0, "kidney": 0}
+    by_result: dict[str, int] = {}
+    avg_conf = 0.0
+    inconclusive_n = 0
+    rows = db.query(Analysis.model_type, Analysis.result, Analysis.confidence, Analysis.inconclusive).all()
+    if rows:
+        for mt, res, conf, inc in rows:
+            if mt in by_model:
+                by_model[mt] += 1
+            key = f"{mt}:{res}"
+            by_result[key] = by_result.get(key, 0) + 1
+            avg_conf += conf or 0
+            if inc:
+                inconclusive_n += 1
+        avg_conf = round(avg_conf / len(rows), 2)
+
+    # Daily activity (last 14 days)
+    daily: dict[str, int] = {}
+    for a in db.query(Analysis.created_at).all():
+        if a.created_at:
+            day = a.created_at.date().isoformat()
+            daily[day] = daily.get(day, 0) + 1
+
+    return {
+        "totals": {"users": users_n, "analyses": analyses_n, "chats": chats_n,
+                   "messages": msgs_n, "memories": mem_n},
+        "by_model": by_model,
+        "by_result": by_result,
+        "avg_confidence": avg_conf,
+        "inconclusive": inconclusive_n,
+        "daily": sorted(daily.items())[-14:],
+    }
+
+
+@app.get("/admin/users")
+async def admin_users(authorization: str = Header(default=""), db: Session | None = Depends(get_db)):
+    _admin_guard(authorization)
+    if not _db_ready(db):
+        raise HTTPException(503, "Database not configured.")
+    users = db.query(User).order_by(User.created_at.desc()).limit(200).all()
+    out = []
+    for u in users:
+        out.append({
+            "id": u.id, "email": u.email, "full_name": u.full_name,
+            "age": u.age, "gender": u.gender, "created_at": u.created_at.isoformat(),
+            "analysis_count": db.query(Analysis).filter(Analysis.user_id == u.id).count(),
+            "chat_count": db.query(ChatSession).filter(ChatSession.user_id == u.id).count(),
+            "memory_count": db.query(UserMemory).filter(UserMemory.user_id == u.id).count(),
+        })
+    return {"users": out}
+
+
+@app.get("/admin/users/{user_id}")
+async def admin_user_detail(
+    user_id: int,
+    authorization: str = Header(default=""),
+    db: Session | None = Depends(get_db),
+):
+    _admin_guard(authorization)
+    if not _db_ready(db):
+        raise HTTPException(503, "Database not configured.")
+    u = db.query(User).filter(User.id == user_id).first()
+    if not u:
+        raise HTTPException(404, "User not found.")
+    analyses = db.query(Analysis).filter(Analysis.user_id == u.id).order_by(Analysis.created_at.desc()).limit(100).all()
+    sessions = db.query(ChatSession).filter(ChatSession.user_id == u.id).order_by(ChatSession.updated_at.desc()).limit(50).all()
+    session_list = []
+    for s in sessions:
+        msgs = db.query(ChatMessage).filter(ChatMessage.session_id == s.id).order_by(ChatMessage.id).all()
+        session_list.append({
+            "id": s.id, "title": s.title, "updated_at": s.updated_at.isoformat(),
+            "messages": [{"role": m.role, "content": m.content} for m in msgs],
+        })
+    memories = db.query(UserMemory).filter(UserMemory.user_id == u.id).all()
+    return {
+        "user": {"id": u.id, "email": u.email, "full_name": u.full_name,
+                 "age": u.age, "gender": u.gender, "created_at": u.created_at.isoformat()},
+        "analyses": [_analysis_dict(a, include_json=False) | {"thumbnail_b64": a.thumbnail_b64 or ""} for a in analyses],
+        "chats": session_list,
+        "memory": [{"key": m.key, "value": m.value, "updated_at": m.updated_at.isoformat()} for m in memories],
+    }
 
 
 if __name__ == "__main__":
