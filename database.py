@@ -19,6 +19,11 @@ from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
+# Neon ka raw string `postgresql://...` hota hai — SQLAlchemy ko driver bhi chahiye
+# (psycopg3). Dono schemes accept karo taake user ka paste kiya hua URL seedha chale.
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
 if not DATABASE_URL:
     _engine = None
     SessionLocal = None

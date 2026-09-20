@@ -1011,7 +1011,7 @@ async def chat_delete_session(
 
 # ── CHAT: assistant engine (Groq, server-side key) ──
 GROQ_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
 
 def _load_skills() -> str:
