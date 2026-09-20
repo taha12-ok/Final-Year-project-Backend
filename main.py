@@ -1214,17 +1214,26 @@ async def doctors_nearby(
         f"nwr[~'^(amenity|healthcare)$'~'^(hospital|clinic|doctors)$'](around:{radius},{lat},{lon});"
         f"out center 60;"
     )
-    try:
-        async with httpx.AsyncClient(timeout=30, headers={"User-Agent": "MedAI-FYP/1.0"}) as client:
-            r = await client.post("https://overpass-api.de/api/interpreter", data={"data": overpass_q})
-            r.raise_for_status()
-            data = r.json()
-    except Exception as e:
-        print(f"[warn] overpass error: {e}")
+    data = None
+    last_err = None
+    # Primary + mirror endpoints — Overpass busy hone pe 504 deta hai
+    for endpoint in ("https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"):
+        try:
+            async with httpx.AsyncClient(timeout=35, headers={"User-Agent": "MedAI-FYP/1.0"}) as client:
+                r = await client.post(endpoint, data={"data": overpass_q})
+                r.raise_for_status()
+                data = r.json()
+                break
+        except Exception as e:
+            last_err = e
+            continue
+    if data is None:
+        print(f"[warn] overpass error: {last_err}")
         return {"facilities": [], "note": "Location service temporarily unavailable — please try again."}
 
+    import math
+
     def haversine(la1, lo1, la2, lo2):
-        import math
         p = math.pi / 180
         return int(6371 * 2 * math.asin(math.sqrt(
             0.5 - math.cos((la2 - la1) * p) / 2 + math.cos(la1 * p) * math.cos(la2 * p) * (1 - math.cos((lo2 - lo1) * p)) / 2)))
