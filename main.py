@@ -1077,6 +1077,39 @@ def _save_memory(db, user_id: int, pairs):
     db.commit()
 
 
+import re as _re
+
+_PAIN_PARTS = ("wrist", "knee", "head", "back", "neck", "shoulder", "elbow",
+               "ankle", "hip", "stomach", "chest", "throat", "leg", "arm",
+               "foot", "hand", "eye", "ear", "tooth", "jaw")
+
+
+def _regex_memory_extract(text: str):
+    """Fallback extractor — jab LLM ###MEMORY### marker emit na kare tab basic
+    durable facts (age / city / body-part pain) user ke message se pakarta hai."""
+    pairs = []
+    t = (text or "")[:2000]
+    m = _re.search(r"\b(?:i am|i'm|im|age|aged)\s+(\d{1,3})\b", t, _re.I)
+    if m and 1 <= int(m.group(1)) <= 120:
+        pairs.append(("age", m.group(1)))
+    m = _re.search(
+        r"\b(?:i live in|i am based in|i'm based in|based in|live in|city of|city)\s+([A-Za-z][A-Za-z ]{2,40})",
+        t, _re.I)
+    if m:
+        city = m.group(1).strip().split("\n")[0].strip(" .,!?.")
+        city = " ".join(city.split()[:3]).title()
+        if city:
+            pairs.append(("city", city))
+    for part in _PAIN_PARTS:
+        m = _re.search(r"\b" + part + r"\b", t, _re.I)
+        if m:
+            lo, hi = max(0, m.start() - 40), min(len(t), m.end() + 40)
+            if _re.search(r"\b(hurts?|pain|aching|ache|sore)\b", t[lo:hi], _re.I):
+                pairs.append((f"{part}_pain", "reported"))
+                break
+    return pairs
+
+
 @app.post("/chat/send")
 async def chat_send(
     body: ChatSendBody,
@@ -1131,6 +1164,8 @@ async def chat_send(
     s.updated_at = utcnow()
     db.commit()
 
+    if not mem_pairs:
+        mem_pairs = _regex_memory_extract(text)  # fallback — LLM marker miss case
     if mem_pairs:
         _save_memory(db, user.id, mem_pairs)
 
