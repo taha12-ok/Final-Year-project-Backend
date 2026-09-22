@@ -144,6 +144,40 @@ class ActivityLog(Base):
     user = relationship("User", back_populates="activities")
 
 
+class Medicine(Base):
+    """User ki dawaiyan — naam, dose, aur din ke time slots ("09:00", "21:00")."""
+    __tablename__ = "medicines"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name = Column(String(120), nullable=False)
+    dose = Column(String(60), default="")
+    times = Column(Text, default="")  # JSON list: ["09:00", "21:00"]
+    active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class MedicineLog(Base):
+    """Adherence record — har dose ka ek row: taken / missed / pending."""
+    __tablename__ = "medicine_logs"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    medicine_id = Column(Integer, ForeignKey("medicines.id"), nullable=False, index=True)
+    day = Column(String(10), nullable=False, index=True)  # "2026-09-23"
+    slot = Column(String(5), nullable=False)              # "09:00"
+    status = Column(String(10), default="pending", nullable=False)  # taken|missed|pending
+    logged_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class UserSetting(Base):
+    """Per-user settings — abhi sirf email reminders on/off."""
+    __tablename__ = "user_settings"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    email_reminders = Column(Boolean, default=True, nullable=False)
+
+
 def init_db():
     if _engine is None:
         return False

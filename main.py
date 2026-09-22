@@ -51,7 +51,7 @@ from calibration import get_temperature, calibrated_softmax, evaluate_confidence
 import base64 as _b64
 from database import (
     get_db, init_db, utcnow, User, Analysis, ChatSession, ChatMessage, UserMemory,
-    ActivityLog,
+    ActivityLog, Medicine, MedicineLog, UserSetting,
 )
 from auth import (
     hash_password, verify_password, create_token, decode_token,
@@ -59,6 +59,7 @@ from auth import (
     register_login_fail, record_login_fail, clear_login_fails,
 )
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from fastapi import Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -335,7 +336,7 @@ def health():
 
 def _save_analysis(db, user_id, model_type, entry, predicted, confidence,
                    reliability, scan_type_warning, image,
-                   alternatives=None, calibration=None, gate=None) -> int | None:
+                   alternatives=None, calibration=None, gate=None, gradcam_b64: str = "") -> int | None:
     """Analysis ko Neon me save karo — returns analysis id (ya None)."""
     if db is None:
         return None
@@ -351,6 +352,7 @@ def _save_analysis(db, user_id, model_type, entry, predicted, confidence,
         "alternatives": alternatives or [],
         "calibration": calibration or {},
         "modality_gate": gate or {},
+        "gradcam_image": gradcam_b64 or "",
     })
     row = Analysis(
         user_id=user_id,
@@ -518,6 +520,7 @@ async def predict(
             alternatives=alternatives,
             calibration={"temperature": temperature},
             gate={"score": gate["score"], "source": gate["source"]},
+            gradcam_b64=gradcam or "",
         )
     except Exception as e:
         print(f"[warn] analysis save failed: {e}")
@@ -892,6 +895,8 @@ def _analysis_dict(a: Analysis, include_json: bool = False) -> dict:
             d["result_json"] = json.loads(a.result_json or "{}")
         except Exception:
             d["result_json"] = {}
+        # naye scans me gradcam result_json me save hota hai
+        d["gradcam_image"] = (d["result_json"] or {}).get("gradcam_image", "")
     return d
 
 
@@ -1149,6 +1154,337 @@ def _regex_memory_extract(text: str):
     return pairs
 
 
+# ============================================================================
+# MEDICINE REMINDERS + TRIAGE
+# ============================================================================
+
+
+def _log_activity(db, user_id: int, kind: str, detail: str = ""):
+    try:
+        db.add(ActivityLog(user_id=user_id, kind=kind[:40], detail=(detail or "")[:300]))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _get_setting(db, user_id: int) -> UserSetting:
+    s = db.query(UserSetting).filter(UserSetting.user_id == user_id).first()
+    if not s:
+        s = UserSetting(user_id=user_id, email_reminders=True)
+        db.add(s)
+        db.commit()
+    return s
+
+
+class MedicineBody(BaseModel):
+    name: str
+    dose: str = ""
+    times: list[str]  # e.g. ["09:00", "21:00"]
+
+
+class MedicineTakeBody(BaseModel):
+    medicine_id: int
+    day: str
+    slot: str
+    status: str = "taken"  # taken | missed
+
+
+class SettingsBody(BaseModel):
+    email_reminders: bool
+
+
+def _parse_times(times) -> list[str]:
+    out = []
+    for t in (times or [])[:6]:
+        s = str(t).strip()
+        m = _re.match(r"^(\d{1,2}):(\d{2})$", s)
+        if m:
+            hh, mm = int(m.group(1)), int(m.group(2))
+            if 0 <= hh <= 23 and 0 <= mm <= 59:
+                out.append(f"{hh:02d}:{mm:02d}")
+    return sorted(set(out)) or ["09:00"]
+
+
+def _today_str() -> str:
+    return utcnow().strftime("%Y-%m-%d")
+
+
+@app.get("/medicines")
+async def medicines_list(user: User = Depends(get_current_user), db: Session | None = Depends(get_db)):
+    if not _db_ready(db):
+        raise HTTPException(503, "Database not configured.")
+    meds = (
+        db.query(Medicine)
+        .filter(Medicine.user_id == user.id, Medicine.active == True)  # noqa: E712
+        .order_by(Medicine.created_at.asc())
+        .all()
+    )
+    return {
+        "medicines": [
+            {"id": m.id, "name": m.name, "dose": m.dose or "",
+             "times": (m.times or "").split(",") if m.times else []}
+            for m in meds
+        ]
+    }
+
+
+@app.post("/medicines")
+async def medicines_add(body: MedicineBody, user: User = Depends(get_current_user), db: Session | None = Depends(get_db)):
+    if not _db_ready(db):
+        raise HTTPException(503, "Database not configured.")
+    name = body.name.strip()[:120]
+    if not name:
+        raise HTTPException(422, "Medicine name is empty.")
+    times = _parse_times(body.times)
+    m = Medicine(user_id=user.id, name=name, dose=body.dose.strip()[:60], times=",".join(times))
+    db.add(m)
+    db.commit()
+    _log_activity(db, user.id, "medicine_add", f"{name} - {body.dose.strip()[:60]} at {', '.join(times)}")
+    return {"id": m.id, "name": m.name, "dose": m.dose, "times": times}
+
+
+@app.delete("/medicines/{mid}")
+async def medicines_stop(mid: int, user: User = Depends(get_current_user), db: Session | None = Depends(get_db)):
+    if not _db_ready(db):
+        raise HTTPException(503, "Database not configured.")
+    m = db.query(Medicine).filter(Medicine.id == mid, Medicine.user_id == user.id).first()
+    if not m:
+        raise HTTPException(404, "Medicine not found.")
+    m.active = False
+    db.commit()
+    _log_activity(db, user.id, "medicine_stop", m.name)
+    return {"ok": True}
+
+
+@app.get("/medicines/today")
+async def medicines_today(user: User = Depends(get_current_user), db: Session | None = Depends(get_db)):
+    """Aaj ka schedule — har active dose ka ek row (existing log status ke sath)."""
+    if not _db_ready(db):
+        raise HTTPException(503, "Database not configured.")
+    day = _today_str()
+    meds = (
+        db.query(Medicine)
+        .filter(Medicine.user_id == user.id, Medicine.active == True)  # noqa: E712
+        .all()
+    )
+    logs = {
+        (l.medicine_id, l.slot): l.status
+        for l in db.query(MedicineLog).filter(MedicineLog.user_id == user.id, MedicineLog.day == day).all()
+    }
+    items = []
+    for m in meds:
+        for slot in (m.times or "").split(","):
+            slot = slot.strip()
+            if not slot:
+                continue
+            items.append({
+                "medicine_id": m.id, "name": m.name, "dose": m.dose or "",
+                "slot": slot, "day": day,
+                "status": logs.get((m.id, slot), "pending"),
+            })
+    items.sort(key=lambda x: x["slot"])
+    taken = sum(1 for i in items if i["status"] == "taken")
+    missed = sum(1 for i in items if i["status"] == "missed")
+    return {"day": day, "items": items, "taken": taken, "missed": missed, "total": len(items)}
+
+
+@app.post("/medicines/log")
+async def medicines_log(body: MedicineTakeBody, user: User = Depends(get_current_user), db: Session | None = Depends(get_db)):
+    if not _db_ready(db):
+        raise HTTPException(503, "Database not configured.")
+    if body.status not in ("taken", "missed"):
+        raise HTTPException(422, "Status must be taken or missed.")
+    m = db.query(Medicine).filter(Medicine.id == body.medicine_id, Medicine.user_id == user.id).first()
+    if not m:
+        raise HTTPException(404, "Medicine not found.")
+    slot = str(body.slot).strip()[:5]
+    l = (
+        db.query(MedicineLog)
+        .filter(MedicineLog.user_id == user.id, MedicineLog.medicine_id == m.id,
+                MedicineLog.day == body.day[:10], MedicineLog.slot == slot)
+        .first()
+    )
+    if l:
+        l.status = body.status
+        l.logged_at = utcnow()
+    else:
+        db.add(MedicineLog(user_id=user.id, medicine_id=m.id, day=body.day[:10], slot=slot, status=body.status))
+    db.commit()
+    _log_activity(db, user.id, f"medicine_{body.status}", f"{m.name} at {slot}")
+    return {"ok": True, "status": body.status}
+
+
+@app.get("/medicines/stats")
+async def medicines_stats(user: User = Depends(get_current_user), db: Session | None = Depends(get_db)):
+    """7-day adherence + current streak (consecutive days ending today/yesterday with all doses taken)."""
+    if not _db_ready(db):
+        raise HTTPException(503, "Database not configured.")
+    from datetime import timedelta
+    today = utcnow().date()
+    days = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]
+    rows = db.query(MedicineLog).filter(MedicineLog.user_id == user.id, MedicineLog.day.in_(days)).all()
+    per_day = {}
+    for r in rows:
+        per_day.setdefault(r.day, []).append(r.status)
+    day_stats = []
+    for d in days:
+        st = per_day.get(d, [])
+        t, mi, p = st.count("taken"), st.count("missed"), st.count("pending")
+        day_stats.append({"day": d, "taken": t, "missed": mi, "pending": p,
+                          "ratio": round(t / len(st), 2) if st else None})
+    taken_all = sum(1 for r in rows if r.status == "taken")
+    decided = sum(1 for r in rows if r.status in ("taken", "missed"))
+    # streak: aaj (ya kal) se peeche ki taraf consecutive perfect days
+    streak = 0
+    start_idx = len(days) - 1 if per_day.get(days[-1]) else len(days) - 2
+    for i in range(start_idx, -1, -1):
+        st = per_day.get(days[i], [])
+        if st and all(s == "taken" for s in st):
+            streak += 1
+        elif i == len(days) - 1 and not st:
+            continue  # aaj abhi koi dose decide nahi hui — kal se ginna
+        else:
+            break
+    return {"adherence_pct": round(100 * taken_all / decided) if decided else None,
+            "streak_days": streak, "week": day_stats}
+
+
+@app.get("/settings/me")
+async def settings_me(user: User = Depends(get_current_user), db: Session | None = Depends(get_db)):
+    if not _db_ready(db):
+        raise HTTPException(503, "Database not configured.")
+    return {"email_reminders": _get_setting(db, user.id).email_reminders}
+
+
+@app.post("/settings/me")
+async def settings_set(body: SettingsBody, user: User = Depends(get_current_user), db: Session | None = Depends(get_db)):
+    if not _db_ready(db):
+        raise HTTPException(503, "Database not configured.")
+    s = _get_setting(db, user.id)
+    s.email_reminders = bool(body.email_reminders)
+    db.commit()
+    return {"email_reminders": s.email_reminders}
+
+
+# ---- Email reminders (Gmail SMTP, app-password; env se config) ---------------
+
+def _send_email(to_addr: str, subject: str, body_text: str) -> bool:
+    host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    port = int(os.getenv("SMTP_PORT", "587"))
+    user_ = os.getenv("SMTP_USER", "")
+    pass_ = os.getenv("SMTP_PASS", "")
+    if not (user_ and pass_):
+        return False
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText(body_text, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = f"MedAI <{user_}>"
+        msg["To"] = to_addr
+        with smtplib.SMTP(host, port, timeout=20) as srv:
+            srv.starttls()
+            srv.login(user_, pass_)
+            srv.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"[warn] email send failed: {e}")
+        return False
+
+
+async def _medicine_reminder_loop():
+    """Har 5 min: due doses ke liye upcoming email + 30 min baad bhi pending ho to missed email.
+    Env: SMTP_USER/SMTP_PASS set hone par hi active. Ek dose ka ek email (log guard)."""
+    import asyncio
+    from database import SessionLocal as _SL
+    sent_keys: set[str] = set()
+    while True:
+        try:
+            await asyncio.sleep(300)
+            if not (os.getenv("SMTP_USER") and os.getenv("SMTP_PASS")) or _SL is None:
+                continue
+            db = _SL()
+            try:
+                now = utcnow()
+                cur = now.strftime("%H:%M")
+                day = now.strftime("%Y-%m-%d")
+                meds = db.query(Medicine).filter(Medicine.active == True).all()  # noqa: E712
+                for m in meds:
+                    for slot in (m.times or "").split(","):
+                        slot = slot.strip()
+                        if not slot:
+                            continue
+                        h1, m1 = int(slot[:2]), int(slot[3:5])
+                        hn, mn = now.hour, now.minute
+                        mins_to = (h1 * 60 + m1) - (hn * 60 + mn)
+                        log = (
+                            db.query(MedicineLog)
+                            .filter(MedicineLog.user_id == m.user_id, MedicineLog.medicine_id == m.id,
+                                    MedicineLog.day == day, MedicineLog.slot == slot)
+                            .first()
+                        )
+                        status = log.status if log else "pending"
+                        u = db.query(User).filter(User.id == m.user_id).first()
+                        if not u:
+                            continue
+                        setting = db.query(UserSetting).filter(UserSetting.user_id == u.id).first()
+                        if setting and not setting.email_reminders:
+                            continue
+                        key_up = f"up:{u.id}:{m.id}:{day}:{slot}"
+                        key_mi = f"mi:{u.id}:{m.id}:{day}:{slot}"
+                        if status == "pending" and 0 <= mins_to <= 15 and key_up not in sent_keys:
+                            if _send_email(u.email, f"MedAI reminder: {m.name} at {slot}",
+                                           f"Assalam-o-alaikum!\n\nAap ki dawai ka time ho raha hai:\n\n  {m.name}"
+                                           f"{' (' + m.dose + ')' if m.dose else ''} at {slot}\n\nApp khol kar 'Taken' mark karein.\n\n- MedAI"):
+                                sent_keys.add(key_up)
+                        elif status == "pending" and mins_to < -30 and key_mi not in sent_keys:
+                            if _send_email(u.email, f"MedAI: missed dose - {m.name} ({slot})",
+                                           f"{m.name} ({slot}) aaj ki dose abhi tak 'Taken' mark nahi hui.\n"
+                                           "Agar li hai to app me mark kar dein, warna doctor se poochein.\n\n- MedAI"):
+                                sent_keys.add(key_mi)
+            finally:
+                db.close()
+        except Exception as e:
+            print(f"[warn] reminder loop: {e}")
+            await asyncio.sleep(60)
+
+
+@app.on_event("startup")
+async def _start_reminder_loop():
+    import asyncio
+    asyncio.create_task(_medicine_reminder_loop())
+
+
+# ---- Triage (deterministic red/amber/green) --------------------------------
+
+_TRIAGE_RED = (
+    "chest pain", "chest pressure", "heart attack", "can't breathe", "cant breathe",
+    "difficulty breathing", "breathless", "saans", "unconscious", "fainted", "seizure",
+    "fits", "stroke", "slurred speech", "severe bleeding", "blood loss", "suicide",
+    "self harm", "overdose", "poison", "drowning",
+)
+_TRIAGE_AMBER = (
+    "high fever", "fever", "vomiting", "severe pain", "tez dard", "bukhar",
+    "persistent headache", "sar dard", "dehydration", "injury", "fracture",
+    "infection", "pus", "burn", "sprain",
+)
+
+
+def _triage_assess(text: str) -> dict | None:
+    """Rule-based urgency — LLM se independent. Red keywords emergency, amber specialist."""
+    t = (text or "")[:1200].lower()
+    if not t:
+        return None
+    if any(k in t for k in _TRIAGE_RED):
+        return {"level": "red", "label": "Emergency",
+                "advice": "Ye emergency ho sakti hai — foran ambulance (1122) ya nearest emergency. Apne sath kisi ko rakhein."}
+    if any(k in t for k in _TRIAGE_AMBER):
+        return {"level": "amber", "label": "See a doctor soon",
+                "advice": "Halat 24-48 ghante me behtar na ho to doctor ko dikhayein — neeche specialist dhoondein."}
+    return {"level": "green", "label": "Self care",
+            "advice": "Lagta hua halke qism ka masla hai — aaram, pani, aur halki khana. 2 din me behtar na ho to doctor se raabta."}
+
+
 @app.post("/chat/send")
 async def chat_send(
     body: ChatSendBody,
@@ -1213,12 +1549,33 @@ async def chat_send(
     if not doctorfind:
         doctorfind = _regex_doctorfind_extract(text)
 
+    # Triage + medicine Q&A — user ke message se deterministic, LLM se pehle.
+    triage = _triage_assess(text)
+    medicine_answer = None
+    tl = text.lower()
+    if any(k in tl for k in ("medicine", "dawa", "dawai", "dawae", "tablet", "dose", "kab leni", "kab lena")):
+        meds = (
+            db.query(Medicine)
+            .filter(Medicine.user_id == user.id, Medicine.active == True)  # noqa: E712
+            .all()
+        )
+        if meds:
+            lines = []
+            for m in meds:
+                slots = ", ".join(s.strip() for s in (m.times or "").split(",") if s.strip())
+                lines.append(f"- {m.name}{' (' + m.dose + ')' if m.dose else ''}: {slots}")
+            medicine_answer = "Aap ki dawaiyan:\n" + "\n".join(lines)
+        else:
+            medicine_answer = "Abhi koi active dawa set nahi hai — Profile > Medicines se add karein, main reminders bhej dunga."
+
     return {
         "session_id": s.id,
         "reply": clean,
         "handoff": handoff,
         "doctorfind": doctorfind,
         "memory_saved": [k for k, _ in mem_pairs],
+        "triage": triage,
+        "medicine_answer": medicine_answer,
     }
 
 
@@ -1475,16 +1832,19 @@ async def admin_users(authorization: str = Header(default=""), db: Session | Non
     if not _db_ready(db):
         raise HTTPException(503, "Database not configured.")
     users = db.query(User).order_by(User.created_at.desc()).limit(200).all()
-    out = []
-    for u in users:
-        out.append({
-            "id": u.id, "email": u.email, "full_name": u.full_name,
-            "age": u.age, "gender": u.gender, "created_at": u.created_at.isoformat(),
-            "analysis_count": db.query(Analysis).filter(Analysis.user_id == u.id).count(),
-            "chat_count": db.query(ChatSession).filter(ChatSession.user_id == u.id).count(),
-            "memory_count": db.query(UserMemory).filter(UserMemory.user_id == u.id).count(),
-            "activity_count": db.query(ActivityLog).filter(ActivityLog.user_id == u.id).count(),
-        })
+    # 4 GROUP BY aggregates instead of per-user COUNT queries (N+1 fix: 800 round-trips -> 4)
+    def _counts(model):
+        rows = db.query(model.user_id, func.count(model.user_id)).group_by(model.user_id).all()
+        return dict(rows)
+    an_c, ch_c, me_c, ac_c = _counts(Analysis), _counts(ChatSession), _counts(UserMemory), _counts(ActivityLog)
+    out = [{
+        "id": u.id, "email": u.email, "full_name": u.full_name,
+        "age": u.age, "gender": u.gender, "created_at": u.created_at.isoformat(),
+        "analysis_count": an_c.get(u.id, 0),
+        "chat_count": ch_c.get(u.id, 0),
+        "memory_count": me_c.get(u.id, 0),
+        "activity_count": ac_c.get(u.id, 0),
+    } for u in users]
     return {"users": out}
 
 
