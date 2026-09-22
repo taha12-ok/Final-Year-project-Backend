@@ -1320,6 +1320,38 @@ async def doctors_geocode(q: str, user: User = Depends(get_current_user)):
     return {"lat": float(data[0]["lat"]), "lon": float(data[0]["lon"]), "name": data[0].get("display_name", q)}
 
 
+@app.get("/doctors/directions")
+async def doctors_directions(
+    lat1: float, lon1: float, lat2: float, lon2: float,
+    user: User = Depends(get_current_user),
+):
+    """OSRM proxy — driving route (lat1,lon1)->(lat2,lon2). Free OSRM servers.
+    Primary + mirror endpoints; browser se direct OSRM blocked ho to yehi chalta hai."""
+    import httpx
+    urls = [
+        f"https://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}?overview=full&geometries=geojson",
+        f"https://routing.openstreetmap.de/routed-car/route/v1/driving/{lon1},{lat1};{lon2},{lat2}?overview=full&geometries=geojson",
+    ]
+    last_err = None
+    for url in urls:
+        try:
+            async with httpx.AsyncClient(timeout=25, headers={"User-Agent": "MedAI-FYP/1.0"}) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                d = r.json()
+                rt = (d.get("routes") or [None])[0]
+                if not rt:
+                    last_err = "empty route"
+                    continue
+                coords = [[c[1], c[0]] for c in rt["geometry"]["coordinates"]]
+                return {"coords": coords, "km": round(rt["distance"] / 1000, 1), "min": int(rt["duration"] // 60)}
+        except Exception as e:
+            last_err = e
+            continue
+    print(f"[warn] osrm error: {last_err}")
+    raise HTTPException(502, "Routing service unavailable right now — try again shortly.")
+
+
 # ── ADMIN PANEL API (hardcoded creds: admin / admin123, env-overridable) ──
 @app.post("/admin/login")
 async def admin_login(body: AdminLoginBody):
