@@ -1371,8 +1371,9 @@ async def settings_set(body: SettingsBody, user: User = Depends(get_current_user
 def _send_email(to_addr: str, subject: str, body_text: str) -> bool:
     host = os.getenv("SMTP_HOST", "smtp.gmail.com")
     port = int(os.getenv("SMTP_PORT", "587"))
-    user_ = os.getenv("SMTP_USER", "")
-    pass_ = os.getenv("SMTP_PASS", "")
+    # Vercel ke contact-form env names bhi accept karo (GMAIL_USER/GMAIL_APP_PASSWORD)
+    user_ = os.getenv("SMTP_USER") or os.getenv("GMAIL_USER", "")
+    pass_ = os.getenv("SMTP_PASS") or os.getenv("GMAIL_APP_PASSWORD", "")
     if not (user_ and pass_):
         return False
     try:
@@ -1401,7 +1402,8 @@ async def _medicine_reminder_loop():
     while True:
         try:
             await asyncio.sleep(300)
-            if not (os.getenv("SMTP_USER") and os.getenv("SMTP_PASS")) or _SL is None:
+            has_smtp = (os.getenv("SMTP_USER") or os.getenv("GMAIL_USER")) and (os.getenv("SMTP_PASS") or os.getenv("GMAIL_APP_PASSWORD"))
+            if not has_smtp or _SL is None:
                 continue
             db = _SL()
             try:
