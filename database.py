@@ -60,6 +60,7 @@ class User(Base):
     analyses = relationship("Analysis", back_populates="user", cascade="all, delete-orphan")
     chat_sessions = relationship("ChatSession", back_populates="user", cascade="all, delete-orphan")
     memories = relationship("UserMemory", back_populates="user", cascade="all, delete-orphan")
+    activities = relationship("ActivityLog", back_populates="user", cascade="all, delete-orphan")
 
 
 class Analysis(Base):
@@ -127,6 +128,20 @@ class UserMemory(Base):
     __table_args__ = (
         Index("ix_user_memory_user_key", "user_id", "key"),
     )
+
+
+class ActivityLog(Base):
+    """Har user action ka trail — ambulance call/copy, find-care search, directions.
+    Profile timeline + admin Activity feed dono isi se bante hain."""
+    __tablename__ = "activity_logs"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    kind = Column(String(40), nullable=False, index=True)
+    detail = Column(Text, default="")
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+
+    user = relationship("User", back_populates="activities")
 
 
 def init_db():

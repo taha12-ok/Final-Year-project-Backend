@@ -51,6 +51,7 @@ from calibration import get_temperature, calibrated_softmax, evaluate_confidence
 import base64 as _b64
 from database import (
     get_db, init_db, utcnow, User, Analysis, ChatSession, ChatMessage, UserMemory,
+    ActivityLog,
 )
 from auth import (
     hash_password, verify_password, create_token, decode_token,
@@ -780,6 +781,11 @@ class MemoryUpsertBody(BaseModel):
     value: str
 
 
+class ActivityBody(BaseModel):
+    kind: str
+    detail: str = ""
+
+
 class AdminLoginBody(BaseModel):
     username: str
     password: str
@@ -1084,6 +1090,39 @@ _PAIN_PARTS = ("wrist", "knee", "head", "back", "neck", "shoulder", "elbow",
                "foot", "hand", "eye", "ear", "tooth", "jaw")
 
 
+def _regex_doctorfind_extract(text: str):
+    """Deterministic doctor-finder fallback — user ke message me find/doctor/hospital
+    intent + city detect karo. LLM marker miss ho tab bhi map khul jaye."""
+    t = (text or "")[:1000]
+    if not _re.search(r"\b(find|search|nearby|near me|around me|where|kahan|dhundo|dhundna|looking for)\b", t, _re.I):
+        return None
+    if not _re.search(r"\b(doctor|doctors|hospital|hospitals|clinic|clinics|dentist|orthopedic|cardiologist|pediatrician|eye specialist|ophthalmologist|urologist|nephrologist|neurologist|neurosurgeon|gp|pharmacy|emergency)\b", t, _re.I):
+        return None
+    spec_map = [
+        (r"dentist|dental|tooth|teeth", "dentist"),
+        (r"orthopedic|ortho|bone", "orthopedic"),
+        (r"cardiolog|heart", "cardiologist"),
+        (r"pediatric|child doctor", "pediatrician"),
+        (r"eye|ophthal", "eye specialist"),
+        (r"urolog|kidney", "urologist"),
+        (r"nephrol", "nephrologist"),
+        (r"neurosurgeon|brain surgeon", "neurosurgeon"),
+        (r"neurolog", "neurologist"),
+        (r"pharmacy|medicine shop", "pharmacy"),
+        (r"emergency|ambulance", "emergency"),
+    ]
+    specialty = "general"
+    for pat, sp in spec_map:
+        if _re.search(pat, t, _re.I):
+            specialty = sp
+            break
+    m = _re.search(r"\b(?:in|near|around|from|at|paas|pass)\s+([A-Z][a-zA-Z]{2,20}(?:\s[A-Z][a-zA-Z]{2,20})?)", t)
+    if not m:  # Roman-Urdu: "Karachi me doctor dhundo" — city pehle, baad me 'me'
+        m = _re.search(r"\b([A-Z][a-zA-Z]{2,20})\s+(?:me|mein|may|main)\b", t)
+    city = m.group(1) if m else ""
+    return {"specialty": specialty, "query": city}
+
+
 def _regex_memory_extract(text: str):
     """Fallback extractor — jab LLM ###MEMORY### marker emit na kare tab basic
     durable facts (age / city / body-part pain) user ke message se pakarta hai."""
@@ -1168,6 +1207,11 @@ async def chat_send(
         mem_pairs = _regex_memory_extract(text)  # fallback — LLM marker miss case
     if mem_pairs:
         _save_memory(db, user.id, mem_pairs)
+
+    # Deterministic doctor-finder fallback — LLM marker miss kare to intent+city
+    # user ke message se hi pakdo (find/doctor/hospital/dentist... keywords).
+    if not doctorfind:
+        doctorfind = _regex_doctorfind_extract(text)
 
     return {
         "session_id": s.id,
@@ -1389,6 +1433,7 @@ async def admin_overview(authorization: str = Header(default=""), db: Session | 
     chats_n = db.query(ChatSession).count()
     msgs_n = db.query(ChatMessage).count()
     mem_n = db.query(UserMemory).count()
+    act_n = db.query(ActivityLog).count()
 
     by_model = {"fracture": 0, "brain": 0, "kidney": 0}
     by_result: dict[str, int] = {}
@@ -1415,7 +1460,7 @@ async def admin_overview(authorization: str = Header(default=""), db: Session | 
 
     return {
         "totals": {"users": users_n, "analyses": analyses_n, "chats": chats_n,
-                   "messages": msgs_n, "memories": mem_n},
+                   "messages": msgs_n, "memories": mem_n, "activities": act_n},
         "by_model": by_model,
         "by_result": by_result,
         "avg_confidence": avg_conf,
@@ -1438,6 +1483,7 @@ async def admin_users(authorization: str = Header(default=""), db: Session | Non
             "analysis_count": db.query(Analysis).filter(Analysis.user_id == u.id).count(),
             "chat_count": db.query(ChatSession).filter(ChatSession.user_id == u.id).count(),
             "memory_count": db.query(UserMemory).filter(UserMemory.user_id == u.id).count(),
+            "activity_count": db.query(ActivityLog).filter(ActivityLog.user_id == u.id).count(),
         })
     return {"users": out}
 
@@ -1464,13 +1510,67 @@ async def admin_user_detail(
             "messages": [{"role": m.role, "content": m.content} for m in msgs],
         })
     memories = db.query(UserMemory).filter(UserMemory.user_id == u.id).all()
+    activities = db.query(ActivityLog).filter(ActivityLog.user_id == u.id).order_by(ActivityLog.created_at.desc()).limit(100).all()
     return {
         "user": {"id": u.id, "email": u.email, "full_name": u.full_name,
                  "age": u.age, "gender": u.gender, "created_at": u.created_at.isoformat()},
         "analyses": [_analysis_dict(a, include_json=False) | {"thumbnail_b64": a.thumbnail_b64 or ""} for a in analyses],
         "chats": session_list,
         "memory": [{"key": m.key, "value": m.value, "updated_at": m.updated_at.isoformat()} for m in memories],
+        "activities": [{"id": a.id, "kind": a.kind, "detail": a.detail or "", "created_at": a.created_at.isoformat()} for a in activities],
     }
+
+
+# ── ACTIVITY LOG (user actions — ambulance, find-care, directions) ──
+@app.post("/activity")
+async def activity_log(body: ActivityBody, user: User = Depends(get_current_user), db: Session | None = Depends(get_db)):
+    """Frontend se har chhoti action log karo: {kind: 'ambulance_call', detail: 'Pakistan 1122'}"""
+    if not _db_ready(db):
+        raise HTTPException(503, "Database not configured.")
+    kind = body.kind[:40].strip()
+    detail = (body.detail or "")[:300].strip()
+    if not kind:
+        raise HTTPException(422, "kind required")
+    db.add(ActivityLog(user_id=user.id, kind=kind, detail=detail))
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/admin/activity")
+async def admin_activity(
+    limit: int = 200,
+    authorization: str = Header(default=""),
+    db: Session | None = Depends(get_db),
+):
+    """All users' recent activity — admin Activity tab (with user info joined)."""
+    _admin_guard(authorization)
+    if not _db_ready(db):
+        raise HTTPException(503, "Database not configured.")
+    rows = (
+        db.query(ActivityLog, User.email, User.full_name)
+        .join(User, ActivityLog.user_id == User.id)
+        .order_by(ActivityLog.created_at.desc())
+        .limit(min(limit, 500))
+        .all()
+    )
+    return {
+        "activities": [
+            {
+                "id": a.id, "kind": a.kind, "detail": a.detail or "",
+                "created_at": a.created_at.isoformat(),
+                "user_id": a.user_id, "user_email": email, "user_name": name,
+            }
+            for a, email, name in rows
+        ]
+    }
+
+
+@app.get("/activity/me")
+async def activity_me(limit: int = 50, user: User = Depends(get_current_user), db: Session | None = Depends(get_db)):
+    if not _db_ready(db):
+        raise HTTPException(503, "Database not configured.")
+    rows = db.query(ActivityLog).filter(ActivityLog.user_id == user.id).order_by(ActivityLog.created_at.desc()).limit(min(limit, 100)).all()
+    return {"activities": [{"id": a.id, "kind": a.kind, "detail": a.detail or "", "created_at": a.created_at.isoformat()} for a in rows]}
 
 
 if __name__ == "__main__":
