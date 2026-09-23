@@ -154,6 +154,7 @@ class Medicine(Base):
     dose = Column(String(60), default="")
     times = Column(Text, default="")  # JSON list: ["09:00", "21:00"]
     active = Column(Boolean, default=True, nullable=False)
+    recipient_email = Column(String(255), default="")  # is dawa ke reminders is email par
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
@@ -176,6 +177,7 @@ class UserSetting(Base):
 
     user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
     email_reminders = Column(Boolean, default=True, nullable=False)
+    reminder_email = Column(String(255), default="")  # khaali = account email
 
 
 def init_db():

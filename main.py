@@ -1180,6 +1180,7 @@ class MedicineBody(BaseModel):
     name: str
     dose: str = ""
     times: list[str]  # e.g. ["09:00", "21:00"]
+    recipient_email: str = ""  # khaali = account email par jayegi
 
 
 class MedicineTakeBody(BaseModel):
@@ -1191,6 +1192,21 @@ class MedicineTakeBody(BaseModel):
 
 class SettingsBody(BaseModel):
     email_reminders: bool
+    reminder_email: str | None = None  # khaali = account email
+
+
+def _reminder_recipient(u: "User", setting: "UserSetting | None") -> str:
+    """Reminder kis email par jaye: per-user setting override, warna account email."""
+    if setting and setting.reminder_email:
+        return setting.reminder_email
+    return u.email
+
+
+def _med_recipient(u: User, m: Medicine, setting) -> str:
+    """Per-medicine override > per-user setting > account email."""
+    if getattr(m, "recipient_email", None):
+        return m.recipient_email
+    return _reminder_recipient(u, setting)
 
 
 def _parse_times(times) -> list[str]:
@@ -1219,12 +1235,15 @@ async def medicines_list(user: User = Depends(get_current_user), db: Session | N
         .order_by(Medicine.created_at.asc())
         .all()
     )
+    setting = db.query(UserSetting).filter(UserSetting.user_id == user.id).first()
     return {
         "medicines": [
             {"id": m.id, "name": m.name, "dose": m.dose or "",
-             "times": (m.times or "").split(",") if m.times else []}
+             "times": (m.times or "").split(",") if m.times else [],
+             "recipient_email": getattr(m, "recipient_email", "") or ""}
             for m in meds
-        ]
+        ],
+        "reminder_email": _reminder_recipient(user, setting),
     }
 
 
@@ -1236,7 +1255,8 @@ async def medicines_add(body: MedicineBody, user: User = Depends(get_current_use
     if not name:
         raise HTTPException(422, "Medicine name is empty.")
     times = _parse_times(body.times)
-    m = Medicine(user_id=user.id, name=name, dose=body.dose.strip()[:60], times=",".join(times))
+    m = Medicine(user_id=user.id, name=name, dose=body.dose.strip()[:60], times=",".join(times),
+                 recipient_email=body.recipient_email.strip().lower()[:255])
     db.add(m)
     db.commit()
     _log_activity(db, user.id, "medicine_add", f"{name} - {body.dose.strip()[:60]} at {', '.join(times)}")
@@ -1353,7 +1373,8 @@ async def medicines_stats(user: User = Depends(get_current_user), db: Session | 
 async def settings_me(user: User = Depends(get_current_user), db: Session | None = Depends(get_db)):
     if not _db_ready(db):
         raise HTTPException(503, "Database not configured.")
-    return {"email_reminders": _get_setting(db, user.id).email_reminders}
+    s = _get_setting(db, user.id)
+    return {"email_reminders": s.email_reminders, "reminder_email": s.reminder_email or ""}
 
 
 @app.post("/settings/me")
@@ -1362,8 +1383,10 @@ async def settings_set(body: SettingsBody, user: User = Depends(get_current_user
         raise HTTPException(503, "Database not configured.")
     s = _get_setting(db, user.id)
     s.email_reminders = bool(body.email_reminders)
+    if body.reminder_email is not None:  # sirf tab change karo jab frontend bheje
+        s.reminder_email = body.reminder_email.strip().lower()[:255]
     db.commit()
-    return {"email_reminders": s.email_reminders}
+    return {"email_reminders": s.email_reminders, "reminder_email": s.reminder_email or ""}
 
 
 # ---- Email reminders (Gmail SMTP, app-password; env se config) ---------------
@@ -1432,15 +1455,16 @@ async def _medicine_reminder_loop():
                         setting = db.query(UserSetting).filter(UserSetting.user_id == u.id).first()
                         if setting and not setting.email_reminders:
                             continue
+                        to_email = _med_recipient(u, m, setting)
                         key_up = f"up:{u.id}:{m.id}:{day}:{slot}"
                         key_mi = f"mi:{u.id}:{m.id}:{day}:{slot}"
                         if status == "pending" and 0 <= mins_to <= 15 and key_up not in sent_keys:
-                            if _send_email(u.email, f"MedAI reminder: {m.name} at {slot}",
+                            if _send_email(to_email, f"MedAI reminder: {m.name} at {slot}",
                                            f"Assalam-o-alaikum!\n\nAap ki dawai ka time ho raha hai:\n\n  {m.name}"
                                            f"{' (' + m.dose + ')' if m.dose else ''} at {slot}\n\nApp khol kar 'Taken' mark karein.\n\n- MedAI"):
                                 sent_keys.add(key_up)
                         elif status == "pending" and mins_to < -30 and key_mi not in sent_keys:
-                            if _send_email(u.email, f"MedAI: missed dose - {m.name} ({slot})",
+                            if _send_email(to_email, f"MedAI: missed dose - {m.name} ({slot})",
                                            f"{m.name} ({slot}) aaj ki dose abhi tak 'Taken' mark nahi hui.\n"
                                            "Agar li hai to app me mark kar dein, warna doctor se poochein.\n\n- MedAI"):
                                 sent_keys.add(key_mi)
@@ -1713,7 +1737,7 @@ async def doctors_geocode(q: str, user: User = Depends(get_current_user)):
     try:
         async with httpx.AsyncClient(timeout=20, headers={"User-Agent": "MedAI-FYP/1.0"}) as client:
             r = await client.get("https://nominatim.openstreetmap.org/search",
-                                 params={"q": q, "format": "json", "limit": 1})
+                                 params={"q": q, "format": "json", "limit": 1, "accept-language": "en"})
             r.raise_for_status()
             data = r.json()
     except Exception:
@@ -1721,6 +1745,28 @@ async def doctors_geocode(q: str, user: User = Depends(get_current_user)):
     if not data:
         raise HTTPException(404, "Location not found — try a bigger nearby city.")
     return {"lat": float(data[0]["lat"]), "lon": float(data[0]["lon"]), "name": data[0].get("display_name", q)}
+
+
+@app.get("/doctors/reverse")
+async def doctors_reverse(lat: float, lon: float, user: User = Depends(get_current_user)):
+    """lat/lon -> human-readable location text (Nominatim reverse).
+    'Use my location' ke sath search field auto-bhar jata hai."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=20, headers={"User-Agent": "MedAI-FYP/1.0"}) as client:
+            r = await client.get("https://nominatim.openstreetmap.org/reverse",
+                                 params={"lat": lat, "lon": lon, "format": "json", "zoom": 10, "accept-language": "en"})
+            r.raise_for_status()
+            data = r.json()
+    except Exception:
+        return {"name": ""}  # khaali — silent, koi search fail nahi hogi
+    addr = data.get("address", {})
+    # City-first label: "Karachi, Pakistan" jaisa
+    label = ", ".join(x for x in [
+        addr.get("city") or addr.get("town") or addr.get("village") or addr.get("county"),
+        addr.get("country"),
+    ] if x)
+    return {"name": label or data.get("display_name", "")}
 
 
 @app.get("/doctors/directions")
@@ -1925,6 +1971,37 @@ async def admin_activity(
             for a, email, name in rows
         ]
     }
+
+
+# ── ADMIN: DB cleanup — sirf taha + 5 clean seed users (duplicates/test junk delete) ──
+SEED_KEEP = {
+    "tahashabbir321@gmail.com",
+    "ali.raza@example.com", "ayesha.khan@example.com", "usman.ahmed@example.com",
+    "fatima.noor@example.com", "bilal.hassan@example.com",
+}
+
+
+@app.post("/admin/cleanup")
+async def admin_cleanup(confirmation: str = "", authorization: str = Header(default=""), db: Session | None = Depends(get_db)):
+    """Database sirf taha + 5 seed users tak saaf — test/junk users aur unka sara data delete.
+    Safety: confirmation='DELETE JUNK' zaroori (galti se call na ho)."""
+    _admin_guard(authorization)
+    if not _db_ready(db):
+        raise HTTPException(503, "Database not configured.")
+    if confirmation != "DELETE JUNK":
+        raise HTTPException(422, "Send confirmation='DELETE JUNK' to run cleanup.")
+    users = db.query(User).all()
+    removed = []
+    for u in users:
+        if u.email.lower() not in SEED_KEEP:
+            removed.append(u.email)
+            # Medicines/logs pe koi ORM cascade nahi — pehle khud delete karo
+            db.query(MedicineLog).filter(MedicineLog.user_id == u.id).delete(synchronize_session=False)
+            db.query(Medicine).filter(Medicine.user_id == u.id).delete(synchronize_session=False)
+            db.query(UserSetting).filter(UserSetting.user_id == u.id).delete(synchronize_session=False)
+            db.delete(u)  # analyses, chats, memories, activities cascade hote hain
+    db.commit()
+    return {"ok": True, "kept": sorted(SEED_KEEP), "removed": removed, "removed_count": len(removed)}
 
 
 @app.get("/activity/me")
